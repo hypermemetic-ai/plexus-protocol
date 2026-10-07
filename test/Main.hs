@@ -4,8 +4,9 @@
 -- (@../plexus-macros/fixtures/conformance/expected/@) and checks that every
 -- schema, wire frame and error frame there parses into the Haskell types and
 -- re-encodes to the same JSON (compared as parsed values, so key order does
--- not count; frame @timestamp@ normalized to 0; @"*"@ in a hash field matches
--- any string — the fixture README's comparison rules).
+-- not count; frame @timestamp@ normalized to 0 — the fixture README's
+-- comparison rules). Its hashes are real since RETURNS-10: every frame's
+-- @plexus_hash@ is the schema's @hash@.
 --
 -- The rest pins the shapes the fixture does not exercise: every
 -- 'RemoteError' variant against RETURNS-4's wire literals
@@ -26,6 +27,7 @@ import Data.Foldable (toList)
 import Data.List (isInfixOf, sort)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import qualified Data.Text as T
 import System.Directory (doesDirectoryExist, listDirectory)
 import System.FilePath (takeExtension, (</>))
 import Test.Hspec
@@ -87,17 +89,14 @@ normalizeFrame (Object o) = Object $ case KM.lookup "metadata" o of
     zeroTimestamp m = m
 normalizeFrame v = v
 
--- | @expected `matches` actual@: equal as parsed JSON, except that @"*"@
--- under a hash key in @expected@ matches any string.
+-- | @expected `matches` actual@: equal as parsed JSON.
 matches :: Value -> Value -> Bool
 matches (Object e) (Object a) =
   sort (KM.keys e) == sort (KM.keys a)
-    && and [sub k ve (KM.lookup k a) | (k, ve) <- KM.toList e]
+    && and [sub ve (KM.lookup k a) | (k, ve) <- KM.toList e]
   where
-    sub k (String "*") (Just (String _)) | k `elem` hashKeys = True
-    sub _ ve (Just va) = matches ve va
-    sub _ _ Nothing = False
-    hashKeys = ["hash", "self_hash", "plexus_hash"]
+    sub ve (Just va) = matches ve va
+    sub _ Nothing = False
 matches (Array e) (Array a) = length e == length a && and (zipWith matches (toList e) (toList a))
 matches e a = e == a
 
@@ -123,6 +122,16 @@ field _ _ = Nothing
 
 title :: Value -> Maybe Value
 title = field "title"
+
+-- | 16 lowercase hex characters: every Plexus hash's form (RETURNS-10).
+isHash16 :: Text -> Bool
+isHash16 h = T.length h == 16 && T.all (`elem` ("0123456789abcdef" :: String)) h
+
+-- | The fixture activation's hash, as @schema.json@ pins it.
+fixtureHash :: IO Text
+fixtureHash = do
+  v <- readJson (fixtureDir </> "schema.json")
+  either fail (pure . psHash) (decodes @PluginSchema v)
 
 -- ============================================================================
 -- Tests
@@ -154,7 +163,9 @@ schemaSpec = describe "expected/schema.json" $ do
     schema <- roundTrips @PluginSchema id v
     psNamespace schema `shouldBe` "conformance"
     psVersion schema `shouldBe` "0.7.0"
-    psSelfHash schema `shouldBe` Just "*"
+    fmap isHash16 (psSelfHash schema) `shouldBe` Just True
+    isHash16 (psHash schema) `shouldBe` True
+    forM_ (psMethods schema) $ \m -> (methodName m, isHash16 (methodHash m)) `shouldBe` (methodName m, True)
     psChildren schema `shouldBe` Nothing
     map methodName (psMethods schema) `shouldBe` ["ping", "lookup", "count", "scan", "load", "warm", "schema"]
 
@@ -229,6 +240,7 @@ wireSpec = describe "expected/wire/*.jsonl" $ do
     Set.fromList (map ("wire" </>) files) `shouldBe` callWireFiles calls
 
   it "every frame of every call parses and re-encodes to the same JSON" $ do
+    hash <- fixtureHash
     files <- sort . filter ((== ".jsonl") . takeExtension) <$> listDirectory wireDir
     length files `shouldBe` 7
     forM_ files $ \f -> do
@@ -241,7 +253,7 @@ wireSpec = describe "expected/wire/*.jsonl" $ do
         other -> expectationFailure (f <> " does not end in done: " <> show other)
       forM_ items $ \item -> do
         itemProvenance item `shouldBe` Provenance ["conformance"]
-        itemPlexusHash item `shouldBe` "*"
+        itemPlexusHash item `shouldBe` hash
 
   it "load: two typed progress frames (LoadStep), then its {ok} item" $ do
     items <- parsed "load.jsonl"
@@ -283,9 +295,11 @@ errorsSpec = describe "expected/errors.jsonl" $ do
     callErrorLines calls `shouldBe` [1 .. length vs]
 
   it "every error frame parses and re-encodes to the same JSON" $ do
+    hash <- fixtureHash
     vs <- load
     items <- mapM (roundTrips @PlexusStreamItem normalizeFrame) vs
     length items `shouldBe` 3
+    forM_ items $ \item -> itemPlexusHash item `shouldBe` hash
 
   it "carries a typed RemoteError, not recoverable" $ do
     items <- load >>= mapM (either fail pure . decodes @PlexusStreamItem)
