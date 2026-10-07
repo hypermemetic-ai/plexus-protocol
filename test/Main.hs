@@ -210,7 +210,7 @@ schemaSpec = describe "expected/schema.json" $ do
       , ("scan",   Just "Row",     Just "ScanError",   Nothing,         CardinalityMany)
       , ("load",   Just "Loaded",  Just "LoadError",   Just "LoadStep", CardinalityMany)
       , ("warm",   Just "Warmed",  Nothing,            Just "Note",     CardinalityMany)
-      , ("schema", Nothing,       Nothing,            Nothing,         CardinalityOne)  -- the macro-generated method; RETURNS-26: its `returns` is `{}` today
+      , ("schema", Just "SchemaResult", Nothing,      Nothing,         CardinalityOne)  -- the macro-generated method (RETURNS-26: a PluginSchema, or one MethodSchema)
       ]
     forM_ (psMethods schema) $ \m -> do
       methodHttpMethod m `shouldBe` "POST"
