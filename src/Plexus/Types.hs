@@ -34,12 +34,16 @@ module Plexus.Types
 
 import Data.Aeson
 import Data.Aeson.Types (Parser)
+import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString.Lazy as LBS
 import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import GHC.Generics (Generic)
+
+-- Only the type: its constructors share names with 'GuidanceErrorType''s.
+import Plexus.RemoteError (RemoteError)
 
 -- | Request ID for JSON-RPC calls
 newtype RequestId = RequestId { unRequestId :: Int }
@@ -97,10 +101,26 @@ instance FromJSON RpcResponse where
       _ -> fail "Expected either 'result' or 'error' field"
 
 -- | JSON-RPC error object
+--
+-- A Plexus rejection (plexus 0.7) keeps JSON-RPC's @code@ and @message@
+-- (the 'RemoteError''s one-line rendering) and carries the typed
+-- 'RemoteError' in @data@:
+--
+-- @
+-- {"code": -32601, "message": "method not found: tickets.frob",
+--  "data": {"kind": "method_not_found", "activation": "tickets", "method": "frob"}}
+-- @
+--
+-- 'errData' is 'Nothing' for a rejection that is not a Plexus call failure
+-- and so carries no 'RemoteError': no @data@ (jsonrpsee's own
+-- @"Method not found"@, a hub's @{ns}.schema@ / @{ns}.respond@ refusals), or
+-- a @data@ that is not a @kind@-tagged object (jsonrpsee's param-parse
+-- rejection carries a string). A @kind@-tagged @data@ is decoded strictly: a
+-- kind this library does not know is a decode error, as for an error frame.
 data RpcError = RpcErrorObj
   { errCode    :: Int
   , errMessage :: Text
-  , errData    :: Maybe Value
+  , errData    :: Maybe RemoteError
   }
   deriving stock (Show, Eq, Generic)
 
@@ -108,7 +128,17 @@ instance FromJSON RpcError where
   parseJSON = withObject "RpcError" $ \o -> RpcErrorObj
     <$> o .: "code"
     <*> o .: "message"
-    <*> o .:? "data"
+    <*> (o .:? "data" >>= traverse parseJSON . (>>= remoteErrorShaped))
+    where
+      remoteErrorShaped :: Value -> Maybe Value
+      remoteErrorShaped v@(Object d) | KM.member "kind" d = Just v
+      remoteErrorShaped _ = Nothing
+
+instance ToJSON RpcError where
+  toJSON RpcErrorObj{..} = object $
+    [ "code"    .= errCode
+    , "message" .= errMessage
+    ] <> catMaybes [("data" .=) <$> errData]
 
 -- | Subscription notification from server
 -- This is what we receive for each stream item
@@ -442,12 +472,25 @@ instance (ToJSON t) => ToJSON (Response t) where
 --
 -- New format uses metadata wrapper:
 -- @{"type":"data","metadata":{...},"content_type":"...","content":{...}}@
+--
+-- plexus 0.7 frames:
+--
+-- @
+-- {"type":"progress","metadata":{...},"content_type":"ns.method","content":<P>}
+-- {"type":"error","metadata":{...},"recoverable":false,"error":<RemoteError>}
+-- @
+--
+-- A progress frame carries the method's declared progress type @P@ (the
+-- schema's 'Plexus.Schema.Recursive.methodProgress'; for the default @Note@,
+-- @{"message": …, "percentage": …}@). An error frame means the call itself
+-- failed; an activation saying no is a 'StreamData' item whose content is
+-- @{"err": …}@.
 data PlexusStreamItem
   = StreamProgress
       { itemPlexusHash  :: Text
       , itemProvenance  :: Provenance
-      , itemMessage     :: Text
-      , itemPercentage  :: Maybe Double
+      , itemContentType :: Text   -- ^ The call's method, as on its data items (e.g. @"tickets.import"@)
+      , itemContent     :: Value  -- ^ The method's progress value @P@
       }
   | StreamData
       { itemPlexusHash  :: Text
@@ -466,8 +509,8 @@ data PlexusStreamItem
   | StreamError
       { itemPlexusHash  :: Text
       , itemProvenance  :: Provenance
-      , itemError       :: Text
-      , itemRecoverable :: Bool
+      , itemError       :: RemoteError  -- ^ Why the call failed, typed
+      , itemRecoverable :: Bool         -- ^ Whether the operation can be retried
       }
   | StreamRequest
       { itemPlexusHash  :: Text
@@ -499,8 +542,8 @@ instance FromJSON PlexusStreamItem where
             prov = metaProvenance meta
         case typ of
           "progress" -> StreamProgress hash prov
-            <$> o .: "message"
-            <*> o .:? "percentage"
+            <$> o .: "content_type"
+            <*> o .: "content"
           "data" -> StreamData hash prov
             <$> o .: "content_type"
             <*> o .: "content"
@@ -510,8 +553,8 @@ instance FromJSON PlexusStreamItem where
             <*> o .:? "available_methods"
             <*> o .:? "method_schema"
           "error" -> StreamError hash prov
-            <$> o .: "message"
-            <*> o .:? "recoverable" .!= False
+            <$> o .: "error"
+            <*> o .: "recoverable"
           "request" -> StreamRequest hash prov
             <$> o .: "request_id"
             <*> o .: "request"
@@ -526,8 +569,8 @@ instance FromJSON PlexusStreamItem where
         case typ of
           "progress" -> StreamProgress hash
             <$> o .: "provenance"
-            <*> o .: "message"
-            <*> o .:? "percentage"
+            <*> o .: "content_type"
+            <*> o .: "content"
           "data" -> StreamData hash
             <$> o .: "provenance"
             <*> o .: "content_type"
@@ -552,11 +595,11 @@ instance FromJSON PlexusStreamItem where
           _ -> fail $ "Unknown event type: " <> T.unpack typ
 
 instance ToJSON PlexusStreamItem where
-  toJSON (StreamProgress hash prov msg pct) = object
+  toJSON (StreamProgress hash prov ct content) = object
     [ "type" .= ("progress" :: Text)
     , "metadata" .= StreamMetadata prov hash 0
-    , "message" .= msg
-    , "percentage" .= pct
+    , "content_type" .= ct
+    , "content" .= content
     ]
   toJSON (StreamData hash prov ct dat) = object
     [ "type" .= ("data" :: Text)
@@ -576,8 +619,8 @@ instance ToJSON PlexusStreamItem where
   toJSON (StreamError hash prov err rec) = object
     [ "type" .= ("error" :: Text)
     , "metadata" .= StreamMetadata prov hash 0
-    , "message" .= err
     , "recoverable" .= rec
+    , "error" .= err
     ]
   toJSON (StreamRequest hash prov reqId reqData timeout) = object $
     [ "type" .= ("request" :: Text)

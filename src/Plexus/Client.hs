@@ -43,6 +43,7 @@ import qualified Data.CaseInsensitive as CI
 import Streaming
 import qualified Streaming.Prelude as Str
 
+import Plexus.RemoteError (RemoteError(..))
 import Plexus.Types
 
 -- | Substrate connection configuration
@@ -236,11 +237,16 @@ substrateRpc conn method params = do
 
   case resp of
     RpcError _ err -> do
-      -- Emit error as StreamError so caller can handle it properly
+      -- Emit error as StreamError so caller can handle it properly.
+      -- A Plexus rejection carries its RemoteError in `data`; one that
+      -- carries none (not a Plexus call failure) is reported as an
+      -- execution failure naming the whole rejection.
       Str.yield $ StreamError
         { itemPlexusHash = ""  -- No hash available for subscription errors
         , itemProvenance = Provenance ["substrate"]
-        , itemError = T.pack $ "Subscription error: " <> show err
+        , itemError = case errData err of
+            Just remote -> remote
+            Nothing     -> Execution $ T.pack $ "Subscription error: " <> show err
         , itemRecoverable = False
         }
 

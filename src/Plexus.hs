@@ -25,9 +25,9 @@
 --
 -- The Plexus RPC protocol returns a unified stream type with variants:
 --
--- * 'StreamProgress' - Progress updates with optional percentage
+-- * 'StreamProgress' - A method's typed progress report (its @P@)
 -- * 'StreamData' - Actual data with content type information
--- * 'StreamError' - Error (may be recoverable)
+-- * 'StreamError' - The call failed, typed as a 'RemoteError' (may be recoverable)
 -- * 'StreamDone' - Stream completed successfully
 --
 module Plexus
@@ -64,9 +64,16 @@ module Plexus
   , PlexusStreamItem(..)
   , Provenance(..)
 
+    -- * Call Failures
+  , RemoteError(..)
+  , ParamProblem(..)
+  , DenyReason(..)
+  , renderRemoteError
+
     -- * Schema Types
   , PluginSchema(..)
   , MethodSchema(..)
+  , Cardinality(..)
   , ChildSummary(..)
   , PluginHash
   , SchemaResult(..)
@@ -80,6 +87,7 @@ module Plexus
   ) where
 
 import Plexus.Types
+import Plexus.RemoteError
 import Plexus.Schema.Recursive
 import Plexus.Client
 import Plexus.Transport

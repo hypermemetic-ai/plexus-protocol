@@ -44,6 +44,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import GHC.Generics (Generic)
 
+import Plexus.RemoteError (renderRemoteError)
 import Plexus.Types (PlexusStreamItem(..))
 import qualified Plexus.Schema.Recursive as RecursiveSchema
 
@@ -530,7 +531,7 @@ extractActivationSchemaEvent (StreamData _ _ contentType dat)
         Success schema -> Just (ActivationSchemaData schema)
         Error _        -> Nothing
   | otherwise = Nothing
-extractActivationSchemaEvent (StreamError _ _ err _) = Just (ActivationSchemaError err)
+extractActivationSchemaEvent (StreamError _ _ err _) = Just (ActivationSchemaError (renderRemoteError err))
 extractActivationSchemaEvent _ = Nothing
 
 -- | Extract FullSchemaEvent from a stream item
@@ -542,7 +543,7 @@ extractFullSchemaEvent (StreamData _ _ contentType dat)
         Success schema -> Just (FullSchemaData schema)
         Error _        -> Nothing
   | otherwise = Nothing
-extractFullSchemaEvent (StreamError _ _ err _) = Just (FullSchemaError err)
+extractFullSchemaEvent (StreamError _ _ err _) = Just (FullSchemaError (renderRemoteError err))
 extractFullSchemaEvent _ = Nothing
 
 -- | Extract PlexusHashEvent from a stream item
@@ -554,7 +555,7 @@ extractHashEvent (StreamData _ _ contentType dat)
         Success hash -> Just (HashData hash)
         Error _      -> Nothing
   | otherwise = Nothing
-extractHashEvent (StreamError _ _ err _) = Just (HashError err)
+extractHashEvent (StreamError _ _ err _) = Just (HashError (renderRemoteError err))
 extractHashEvent _ = Nothing
 
 -- | Extract recursive plugin schema from stream item
@@ -564,5 +565,5 @@ extractRecursiveSchema :: PlexusStreamItem -> Maybe (Either Text RecursiveSchema
 extractRecursiveSchema (StreamData _ _ contentType dat)
   | contentType == "plexus.schema" = Just $ RecursiveSchema.parsePluginSchema dat
   | otherwise = Nothing
-extractRecursiveSchema (StreamError _ _ err _) = Just (Left err)
+extractRecursiveSchema (StreamError _ _ err _) = Just (Left (renderRemoteError err))
 extractRecursiveSchema _ = Nothing
