@@ -99,14 +99,36 @@ case result of
     print schema
 ```
 
-### Stream Items
+### Stream Items (plexus 0.7)
 
 ```haskell
 data PlexusStreamItem
-  = StreamProgress Provenance PluginHash Text (Maybe Int)
-  | StreamData Provenance PluginHash Text Value
-  | StreamError Provenance PluginHash Text Bool
-  | StreamDone Provenance PluginHash
+  = StreamProgress Text Provenance Text Value        -- hash, provenance, content_type, content (the method's progress P)
+  | StreamData     Text Provenance Text Value        -- hash, provenance, content_type, content (T, or {"ok": T} | {"err": E})
+  | StreamGuidance …
+  | StreamError    Text Provenance RemoteError Bool  -- hash, provenance, error, recoverable
+  | StreamRequest  …
+  | StreamDone     Text Provenance
+```
+
+An error frame means the call itself failed, and says why with a
+`RemoteError` (`Plexus.RemoteError`, mirroring `plexus_client::RemoteError`;
+`renderRemoteError` is its one-line rendering). A JSON-RPC rejection carries
+the same type in `errData`. An activation saying no is a data item whose
+content is `{"err": …}`.
+
+```haskell
+data RemoteError
+  = ActivationNotFound Text            -- activation
+  | MethodNotFound Text Text           -- activation, method
+  | InvalidParams (Maybe Text) ParamProblem
+  | Unauthenticated
+  | Forbidden DenyReason
+  | HandleNotSupported Text            -- activation
+  | Execution Text                     -- message
+
+data ParamProblem = Missing | Malformed Text
+data DenyReason   = MissingScope Text | TenantBoundary | NotAccepted
 ```
 
 ### Schema Types
@@ -117,17 +139,24 @@ data PluginSchema = PluginSchema
   , psVersion         :: Text
   , psDescription     :: Text
   , psLongDescription :: Maybe Text
+  , psSelfHash        :: Maybe PluginHash
   , psHash            :: PluginHash
   , psMethods         :: [MethodSchema]
   , psChildren        :: Maybe [ChildSummary]
+  , psDeprecation     :: Maybe DeprecationInfo
   }
 
+-- plexus 0.7: a method's contract is T, E?, P? and its cardinality
 data MethodSchema = MethodSchema
   { methodName        :: Text
   , methodDescription :: Text
   , methodHash        :: PluginHash
   , methodParams      :: Maybe Value  -- JSON Schema
-  , methodReturns     :: Maybe Value  -- JSON Schema
+  , methodReturns     :: Value        -- JSON Schema of the item type T (required)
+  , methodError       :: Maybe Value  -- JSON Schema of the error type E (fallible methods)
+  , methodProgress    :: Maybe Value  -- JSON Schema of the progress type P
+  , methodCardinality :: Cardinality  -- CardinalityOne | CardinalityMany (required)
+  , …                                 -- bidirectional, http_method, request/response types, deprecation, role
   }
 
 data SchemaResult
@@ -157,6 +186,10 @@ src/
 cabal build
 cabal test
 ```
+
+The tests read the plexus 0.7 conformance fixture (RETURNS-7) by sibling
+path, `../plexus-macros/fixtures/conformance/expected/`: check out
+plexus-macros next to this repository first.
 
 ## License
 
