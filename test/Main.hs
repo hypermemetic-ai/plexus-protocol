@@ -158,6 +158,22 @@ schemaSpec = describe "expected/schema.json" $ do
     psChildren schema `shouldBe` Nothing
     map methodName (psMethods schema) `shouldBe` ["ping", "lookup", "count", "scan", "load", "warm", "schema"]
 
+  it "carries an activation's request schema as psRequest (CONTEXT-5) and omits it when absent" $ do
+    v <- load
+    plain <- either fail pure (decodes @PluginSchema v)
+    psRequest plain `shouldBe` Nothing
+    let req = object
+          [ "type" .= ("object" :: Text)
+          , "properties" .= object
+              [ "auth_token" .= object [ "type" .= ("string" :: Text), "x-plexus-source" .= object [ "from" .= ("cookie" :: Text), "name" .= ("access_token" :: Text) ] ] ]
+          ]
+        withReq = case v of
+          Object o -> Object (KM.insert "request" req o)
+          other    -> other
+    schema <- roundTrips @PluginSchema id withReq
+    psRequest schema `shouldBe` Just req
+    toJSON plain `shouldBe` v
+
   it "parses as a SchemaResult (a plugin) and re-encodes to the same JSON" $ do
     v <- load
     result <- roundTrips @SchemaResult id v
