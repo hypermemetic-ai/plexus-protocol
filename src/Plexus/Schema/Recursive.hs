@@ -294,6 +294,9 @@ data PluginSchema = PluginSchema
   , psMethods         :: [MethodSchema]
   , psChildren        :: Maybe [ChildSummary]  -- ^ Nothing = leaf, Just = hub activation
   , psDeprecation     :: Maybe DeprecationInfo -- ^ Activation-level deprecation (IR-5)
+  , psRequest         :: Maybe Value  -- ^ JSON Schema of the activation's request type (@request@): each
+                                      --   property carries @x-plexus-source@ (cookie, header, query, peer);
+                                      --   Nothing when the activation declares none (CONTEXT-5)
   }
   deriving stock (Show, Eq, Generic)
 
@@ -308,6 +311,7 @@ instance FromJSON PluginSchema where
     <*> o .:? "methods" .!= []
     <*> o .:? "children"
     <*> o .:? "deprecation"
+    <*> o .:? "request"
 
 -- | Encodes as the Rust @PluginSchema@ serializes: an absent optional field
 --   is omitted, not @null@.
@@ -323,6 +327,7 @@ instance ToJSON PluginSchema where
     , "self_hash"        .=? psSelfHash
     , "children"         .=? psChildren
     , "deprecation"      .=? psDeprecation
+    , "request"          .=? psRequest
     ]
 
 -- | A key whose value is omitted when 'Nothing'.
