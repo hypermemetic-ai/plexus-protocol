@@ -237,11 +237,12 @@ substrateRpc conn method params = do
   case resp of
     RpcError _ err -> do
       -- Emit error as StreamError so caller can handle it properly
-      Str.yield $ StreamError
+      Str.yield $ StreamErrorWith
         { itemPlexusHash = ""  -- No hash available for subscription errors
         , itemProvenance = Provenance ["substrate"]
         , itemError = T.pack $ "Subscription error: " <> show err
         , itemRecoverable = False
+        , itemErrorRefusal = Nothing
         }
 
     RpcSuccess _ result -> do
