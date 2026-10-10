@@ -43,6 +43,11 @@ module Plexus.Schema.Recursive
   , View(..)
   , hasAuthColumns
 
+    -- * Help metadata (SYNAPSE-13)
+  , MethodExample(..)
+  , paramValues
+  , xPlexusValues
+
     -- * Queries
   , isHubActivation
   , isLeafActivation
@@ -59,6 +64,8 @@ import Control.Applicative ((<|>))
 
 import Data.Aeson
 import Data.Aeson.Types (Parser)
+import qualified Data.Aeson.Key as K
+import qualified Data.Aeson.KeyMap as KM
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -219,6 +226,8 @@ data MethodSchema = MethodSchema
   , methodTarget          :: Maybe Text             -- ^ AUTH-3: the param that locates what a call acts on
   , methodHeldOn          :: Maybe [Text]           -- ^ AUTH-4: where the caller holds the grant (its view only)
   , methodPublic          :: Bool                   -- ^ AUTH-3: callable anonymously (the auth activation's door)
+  , methodGroup           :: Maybe Text             -- ^ SYNAPSE-13: the method's group in a listing (OpenAPI's tag)
+  , methodExamples        :: [MethodExample]        -- ^ SYNAPSE-13: worked calls, each its params and a note
   }
   deriving stock (Show, Eq, Generic)
 
@@ -242,6 +251,9 @@ instance FromJSON MethodSchema where
     <*> o .:? "target"
     <*> o .:? "held_on"
     <*> o .:? "public" .!= False
+    -- SYNAPSE-13: absent on an older hub; an unreadable one is ignored
+    <*> (o .:? "group" <|> pure Nothing)
+    <*> (o .:? "examples" .!= [] <|> pure [])
 
 instance ToJSON MethodSchema where
   toJSON MethodSchema{..} = object $
@@ -263,7 +275,39 @@ instance ToJSON MethodSchema where
     , ("target"           .=) <$> methodTarget
     , ("held_on"          .=) <$> methodHeldOn
     , if methodPublic then Just ("public" .= True) else Nothing
+    , ("group"            .=) <$> methodGroup
+    , if null methodExamples then Nothing else Just ("examples" .= methodExamples)
     ]
+
+-- | SYNAPSE-13: one worked call of a method — the params it sends and a
+-- note saying what it does. A client renders it as a command line.
+data MethodExample = MethodExample
+  { exampleParams :: Value       -- ^ the params object, as the method takes it
+  , exampleNote   :: Maybe Text  -- ^ what the call does, in a line
+  }
+  deriving stock (Show, Eq, Generic)
+
+instance FromJSON MethodExample where
+  parseJSON = withObject "MethodExample" $ \o -> MethodExample
+    <$> o .:? "params" .!= Object mempty
+    <*> o .:? "note"
+
+instance ToJSON MethodExample where
+  toJSON MethodExample{..} = object $
+    ("params" .= exampleParams) : maybe [] (\n -> ["note" .= n]) exampleNote
+
+-- | SYNAPSE-13: the JSON Schema extension key on a param's property that
+-- lists the values it is meant to take — a hint, never enforced.
+xPlexusValues :: Text
+xPlexusValues = "x-plexus-values"
+
+-- | SYNAPSE-13: the values a param's property says it is meant to take
+-- (@x-plexus-values@), when it says them.
+paramValues :: Value -> Maybe [Text]
+paramValues (Object po) = case KM.lookup (K.fromText xPlexusValues) po of
+  Just (Array vs) -> Just [t | String t <- foldr (:) [] vs]
+  _ -> Nothing
+paramValues _ = Nothing
 
 -- | Shallow plugin schema (what we receive from {backend}.schema)
 --
