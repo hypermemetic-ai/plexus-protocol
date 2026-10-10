@@ -1,3 +1,5 @@
+{-# LANGUAGE PatternSynonyms #-}
+
 -- | JSON-RPC types for communicating with Plexus RPC servers
 module Plexus.Types
   ( -- * JSON-RPC Protocol
@@ -10,7 +12,9 @@ module Plexus.Types
   , SubscriptionId(..)
 
     -- * Plexus Stream Types
-  , PlexusStreamItem(..)
+  , PlexusStreamItem(.., StreamError)
+  , itemRefusal
+  , Refusal(..)
   , Provenance(..)
   , StreamMetadata(..)
   , GuidanceErrorType(..)
@@ -32,7 +36,9 @@ module Plexus.Types
   , getPlexusHash
   ) where
 
+import Control.Applicative ((<|>))
 import Data.Aeson
+import qualified Data.Aeson.KeyMap as KM
 import Data.Aeson.Types (Parser)
 import qualified Data.ByteString.Lazy as LBS
 import Data.Maybe (catMaybes)
@@ -40,6 +46,8 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
 import GHC.Generics (Generic)
+
+import Plexus.Auth (Refusal(..), refusalFromObject)
 
 -- | Request ID for JSON-RPC calls
 newtype RequestId = RequestId { unRequestId :: Int }
@@ -463,11 +471,14 @@ data PlexusStreamItem
       , itemAvailableMethods  :: Maybe [Text]
       , itemMethodSchema      :: Maybe Value
       }
-  | StreamError
+  | StreamErrorWith
       { itemPlexusHash  :: Text
       , itemProvenance  :: Provenance
       , itemError       :: Text
       , itemRecoverable :: Bool
+      , itemErrorRefusal :: Maybe Refusal
+        -- ^ AUTH-2: @error_kind: "forbidden"@ and what it names; Nothing
+        -- for every other error (and on every hub without a gate)
       }
   | StreamRequest
       { itemPlexusHash  :: Text
@@ -481,6 +492,24 @@ data PlexusStreamItem
       , itemProvenance :: Provenance
       }
   deriving stock (Show, Eq, Generic)
+
+-- | An error item as it was before AUTH-2: hash, provenance, message,
+-- recoverable. Matches every error (a refusal too); builds one with no
+-- refusal. 'StreamErrorWith' carries the typed refusal.
+pattern StreamError :: Text -> Provenance -> Text -> Bool -> PlexusStreamItem
+pattern StreamError hash prov err rec <- StreamErrorWith hash prov err rec _
+  where StreamError hash prov err rec = StreamErrorWith hash prov err rec Nothing
+
+{-# COMPLETE StreamProgress, StreamData, StreamGuidance, StreamError, StreamRequest, StreamDone #-}
+
+-- | AUTH-2: the refusal an item carries — an error item with
+-- @error_kind: "forbidden"@, or a data item whose content is one (an
+-- in-band error event naming the same fields).
+itemRefusal :: PlexusStreamItem -> Maybe Refusal
+itemRefusal = \case
+  StreamErrorWith _ _ _ _ r -> r
+  StreamData _ _ _ (Object o) -> refusalFromObject o
+  _ -> Nothing
 
 instance FromJSON PlexusStreamItem where
   parseJSON = withObject "PlexusStreamItem" $ \o -> do
@@ -509,9 +538,10 @@ instance FromJSON PlexusStreamItem where
             <*> o .: "suggestion"
             <*> o .:? "available_methods"
             <*> o .:? "method_schema"
-          "error" -> StreamError hash prov
+          "error" -> StreamErrorWith hash prov
             <$> o .: "message"
             <*> o .:? "recoverable" .!= False
+            <*> pure (refusalFromObject o)
           "request" -> StreamRequest hash prov
             <$> o .: "request_id"
             <*> o .: "request"
@@ -522,7 +552,9 @@ instance FromJSON PlexusStreamItem where
       -- Legacy format: flat structure
       parseLegacy :: Text -> Object -> Parser PlexusStreamItem
       parseLegacy typ o = do
-        hash <- o .: "plexus_hash"
+        -- an error item may come bare (AUTH-2's refusal is written so):
+        -- no hash or provenance is no reason to lose it
+        hash <- if typ == "error" then o .:? "plexus_hash" .!= "" else o .: "plexus_hash"
         case typ of
           "progress" -> StreamProgress hash
             <$> o .: "provenance"
@@ -538,10 +570,11 @@ instance FromJSON PlexusStreamItem where
             <*> o .: "suggestion"
             <*> o .:? "available_methods"
             <*> o .:? "method_schema"
-          "error" -> StreamError hash
-            <$> o .: "provenance"
-            <*> o .: "error"
-            <*> o .: "recoverable"
+          "error" -> StreamErrorWith hash
+            <$> o .:? "provenance" .!= Provenance []
+            <*> (o .: "error" <|> o .: "message")
+            <*> o .:? "recoverable" .!= False
+            <*> pure (refusalFromObject o)
           "request" -> StreamRequest hash
             <$> o .: "provenance"
             <*> o .: "request_id"
@@ -573,12 +606,17 @@ instance ToJSON PlexusStreamItem where
     [ ("available_methods" .=) <$> availMethods
     , ("method_schema" .=) <$> methodSchema
     ]
-  toJSON (StreamError hash prov err rec) = object
+  toJSON (StreamErrorWith hash prov err rec refusal) = object $
     [ "type" .= ("error" :: Text)
     , "metadata" .= StreamMetadata prov hash 0
     , "message" .= err
     , "recoverable" .= rec
-    ]
+    ] <> refusalFields
+    where
+      -- the refusal's own fields, beside the message (as the hub sent them)
+      refusalFields = case toJSON <$> refusal of
+        Just (Object ro) -> [ (k, v) | (k, v) <- KM.toList ro, k /= "message" ]
+        _ -> []
   toJSON (StreamRequest hash prov reqId reqData timeout) = object $
     [ "type" .= ("request" :: Text)
     , "metadata" .= StreamMetadata prov hash 0

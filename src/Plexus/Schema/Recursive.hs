@@ -39,6 +39,10 @@ module Plexus.Schema.Recursive
   , ParamSchema(..)
   , MethodRole(..)
 
+    -- * The caller's view (AUTH-3 / AUTH-4)
+  , View(..)
+  , hasAuthColumns
+
     -- * Queries
   , isHubActivation
   , isLeafActivation
@@ -58,7 +62,10 @@ import Data.Aeson.Types (Parser)
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
+import Data.Map.Strict (Map)
 import GHC.Generics (Generic)
+
+import Plexus.Auth (View(..))
 
 -- ============================================================================
 -- Deprecation Metadata (IR-5)
@@ -182,8 +189,9 @@ data ChildSummary = ChildSummary
 instance FromJSON ChildSummary where
   parseJSON = withObject "ChildSummary" $ \o -> ChildSummary
     <$> o .: "namespace"
-    <*> o .: "description"
-    <*> o .: "hash"
+    -- AUTH-4: an anonymous view's children may be bare
+    <*> o .:? "description" .!= ""
+    <*> o .:? "hash" .!= ""
 
 instance ToJSON ChildSummary where
   toJSON ChildSummary{..} = object
@@ -206,14 +214,20 @@ data MethodSchema = MethodSchema
   , methodDeprecation     :: Maybe DeprecationInfo  -- ^ Deprecation info, if any (IR-5)
   , methodParamSchemas    :: Maybe [ParamSchema]    -- ^ Optional structured param info with per-field deprecations (IR-5)
   , methodRole            :: MethodRole             -- ^ Structural role in the activation graph (IR-2 / IR-3); defaults to 'MethodRoleRpc'
+  , methodLongDescription :: Maybe Text             -- ^ AUTH-3: the doc comment, beside the short description
+  , methodGrant           :: Maybe Text             -- ^ AUTH-3: @<activation>.<method>@, e.g. @tickets.set_status@
+  , methodTarget          :: Maybe Text             -- ^ AUTH-3: the param that locates what a call acts on
+  , methodHeldOn          :: Maybe [Text]           -- ^ AUTH-4: where the caller holds the grant (its view only)
+  , methodPublic          :: Bool                   -- ^ AUTH-3: callable anonymously (the auth activation's door)
   }
   deriving stock (Show, Eq, Generic)
 
 instance FromJSON MethodSchema where
   parseJSON = withObject "MethodSchema" $ \o -> MethodSchema
     <$> o .: "name"
-    <*> o .: "description"
-    <*> o .: "hash"
+    -- AUTH-4: an anonymous view may name a method and no more
+    <*> o .:? "description" .!= ""
+    <*> o .:? "hash" .!= ""
     <*> o .:? "params"
     <*> o .:? "returns"
     <*> o .:? "streaming"      .!= False
@@ -223,9 +237,14 @@ instance FromJSON MethodSchema where
     <*> o .:? "deprecation"
     <*> o .:? "param_schemas"
     <*> o .:? "role" .!= MethodRoleRpc
+    <*> o .:? "long_description"
+    <*> o .:? "grant"
+    <*> o .:? "target"
+    <*> o .:? "held_on"
+    <*> o .:? "public" .!= False
 
 instance ToJSON MethodSchema where
-  toJSON MethodSchema{..} = object
+  toJSON MethodSchema{..} = object $
     [ "name"           .= methodName
     , "description"    .= methodDescription
     , "hash"           .= methodHash
@@ -238,6 +257,12 @@ instance ToJSON MethodSchema where
     , "deprecation"    .= methodDeprecation
     , "param_schemas"  .= methodParamSchemas
     , "role"           .= methodRole
+    ] <> catMaybes
+    [ ("long_description" .=) <$> methodLongDescription
+    , ("grant"            .=) <$> methodGrant
+    , ("target"           .=) <$> methodTarget
+    , ("held_on"          .=) <$> methodHeldOn
+    , if methodPublic then Just ("public" .= True) else Nothing
     ]
 
 -- | Shallow plugin schema (what we receive from {backend}.schema)
@@ -253,22 +278,27 @@ data PluginSchema = PluginSchema
   , psMethods         :: [MethodSchema]
   , psChildren        :: Maybe [ChildSummary]  -- ^ Nothing = leaf, Just = hub activation
   , psDeprecation     :: Maybe DeprecationInfo -- ^ Activation-level deprecation (IR-5)
+  , psRoles           :: Maybe (Map Text [Text]) -- ^ AUTH-3: the activation's default roles, each its grants
+  , psView            :: Maybe View            -- ^ AUTH-4: which view this schema answers from
   }
   deriving stock (Show, Eq, Generic)
 
 instance FromJSON PluginSchema where
   parseJSON = withObject "PluginSchema" $ \o -> PluginSchema
     <$> o .: "namespace"
-    <*> o .: "version"
-    <*> o .: "description"
+    -- AUTH-4: an anonymous view's schema may omit what it does not show
+    <*> o .:? "version" .!= ""
+    <*> o .:? "description" .!= ""
     <*> o .:? "long_description"
-    <*> o .: "hash"
+    <*> o .:? "hash" .!= ""
     <*> o .:? "methods" .!= []
     <*> o .:? "children"
     <*> o .:? "deprecation"
+    <*> (o .:? "roles" <|> pure Nothing)
+    <*> (o .:? "view" <|> pure Nothing)
 
 instance ToJSON PluginSchema where
-  toJSON PluginSchema{..} = object
+  toJSON PluginSchema{..} = object $
     [ "namespace"        .= psNamespace
     , "version"          .= psVersion
     , "description"      .= psDescription
@@ -277,6 +307,9 @@ instance ToJSON PluginSchema where
     , "methods"          .= psMethods
     , "children"         .= psChildren
     , "deprecation"      .= psDeprecation
+    ] <> catMaybes
+    [ ("roles" .=) <$> psRoles
+    , ("view"  .=) <$> psView
     ]
 
 -- | Result of a schema query - can be either a full plugin or just a method
@@ -299,6 +332,11 @@ instance ToJSON SchemaResult where
 -- ============================================================================
 -- Basic Queries
 -- ============================================================================
+
+-- | AUTH-4: does any method here say its grant or where it is held? Then
+-- help shows those columns; otherwise it renders as before AUTH.
+hasAuthColumns :: PluginSchema -> Bool
+hasAuthColumns ps = any (\m -> maybe False (const True) (methodGrant m) || maybe False (const True) (methodHeldOn m)) (psMethods ps)
 
 -- | Is this a hub activation (has children)?
 isHubActivation :: PluginSchema -> Bool
