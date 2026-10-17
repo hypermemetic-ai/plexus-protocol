@@ -30,6 +30,23 @@ main = do
   disconnect conn
 ```
 
+### wss (SCAFFOLD-21, 0.5.2.0)
+
+A hub behind TLS (a hosted app: `wss://<host>/ws`) is dialed when
+`substrateTls` is `Just`: the `tls` package over a TCP socket, SNI and the
+name check against `substrateHost`, the chain against the system's trust
+store (crypton-x509-system; `SYSTEM_CERTIFICATE_PATH` overrides it) plus each
+PEM file in `tlsCaFiles`. Verification cannot be turned off. `defaultConfig`
+is `Nothing` (plain `ws://`), as before; the upgrade's `Host` is `hostHeader`
+(the host alone on the scheme's default port).
+
+```haskell
+let cfg = (defaultConfig "hostdemo")
+      { substrateHost = "hostdemo.menger.sh", substratePort = 443
+      , substratePath = "/ws", substrateTls = Just defaultTlsOptions }
+Right items <- rpcCallWith cfg "_info" Null
+```
+
 ### Schema Fetching
 
 ```haskell

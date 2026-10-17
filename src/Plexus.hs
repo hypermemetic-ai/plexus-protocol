@@ -34,6 +34,8 @@ module Plexus
   ( -- * Connection (re-exported from Plexus.Client)
     SubstrateConnection
   , SubstrateConfig(..)
+  , TlsOptions(..)
+  , defaultTlsOptions
   , defaultConfig
   , connect
   , disconnect

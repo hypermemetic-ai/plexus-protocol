@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               plexus-protocol
-version:            0.5.1.0
+version:            0.5.2.0
 synopsis:           Plexus RPC protocol types and client
 license:            MIT
 author:
@@ -27,7 +27,11 @@ library
     case-insensitive >= 1.2,
     containers >= 0.6,
     websockets >= 0.13,
-    network >= 3.1,
+    network >= 3.1.2,
+    -- SCAFFOLD-21: wss — TLS, the certificate checked against the system store
+    tls >= 2.1 && < 2.5,
+    crypton-x509-store >= 1.6 && < 1.10,
+    crypton-x509-system >= 1.6 && < 1.10,
     async >= 2.2,
     stm >= 2.5,
     streaming >= 0.2,
