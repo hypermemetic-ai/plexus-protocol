@@ -25,14 +25,19 @@ module Plexus.Client
 
     -- * Configuration
   , SubstrateConfig(..)
+  , TlsOptions(..)
+  , defaultTlsOptions
   , defaultConfig
   , cookieHeader
+  , hostHeader
   ) where
 
 import Control.Concurrent (forkIO, killThread, threadDelay)
+import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
+import System.IO.Unsafe (unsafePerformIO)
 import Control.Concurrent.Async (Async, async, cancel, wait)
 import Control.Concurrent.STM
-import Control.Exception (Exception, SomeException, catch, fromException, throwIO, finally)
+import Control.Exception (Exception, SomeException, bracketOnError, catch, fromException, throwIO, finally, try)
 import Control.Monad (forever, void, when, unless)
 import GHC.Clock (getMonotonicTime)
 import System.Environment (lookupEnv)
@@ -48,8 +53,15 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import Network.WebSockets (Connection)
 import qualified Network.WebSockets as WS
+import qualified Network.WebSockets.Stream as WSS
+import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.CaseInsensitive as CI
+import Data.X509.CertificateStore (CertificateStore, makeCertificateStore)
+import Data.X509.File (readSignedObject)
+import qualified Network.Socket as S
+import qualified Network.TLS as TLS
+import System.X509 (getSystemCertificateStore)
 import Streaming
 import qualified Streaming.Prelude as Str
 
@@ -62,8 +74,28 @@ data SubstrateConfig = SubstrateConfig
   , substratePath    :: String
   , substrateBackend :: Text    -- ^ Backend name (e.g., "plexus")
   , substrateHeaders :: WS.Headers  -- ^ Extra HTTP upgrade headers (e.g., Cookie)
+  , substrateTls     :: Maybe TlsOptions
+    -- ^ SCAFFOLD-21: 'Nothing' dials @ws://@; 'Just' dials @wss://@ — TLS
+    -- with the server's certificate verified against the system's trust
+    -- store (plus 'tlsCaFiles') and its name ('substrateHost'), sent as SNI.
   }
   deriving stock (Show, Eq, Ord)
+
+-- | SCAFFOLD-21: how a @wss://@ connection is made. The certificate is
+-- always verified — the chain against the system's trust store (the
+-- distribution's bundle; @SYSTEM_CERTIFICATE_PATH@ overrides where it is
+-- read from) and every PEM file in 'tlsCaFiles' (a local CA, for a test
+-- behind a proxy of one's own), the name against 'substrateHost'. There is
+-- no switch that skips the check.
+data TlsOptions = TlsOptions
+  { tlsCaFiles :: [FilePath]
+    -- ^ PEM files of certificates trusted beside the system's
+  }
+  deriving stock (Show, Eq, Ord)
+
+-- | Verify against the system's trust store alone.
+defaultTlsOptions :: TlsOptions
+defaultTlsOptions = TlsOptions { tlsCaFiles = [] }
 
 -- | Default configuration for local development (requires backend)
 defaultConfig :: Text -> SubstrateConfig
@@ -73,7 +105,19 @@ defaultConfig backend = SubstrateConfig
   , substratePath    = "/"
   , substrateBackend = backend
   , substrateHeaders = []
+  , substrateTls     = Nothing
   }
+
+-- | SCAFFOLD-21: the upgrade's @Host@ — the host alone on the scheme's
+-- default port (443 for wss, 80 for ws), else @host:port@.
+hostHeader :: SubstrateConfig -> String
+hostHeader SubstrateConfig{..}
+  | substratePort == defaultPort = substrateHost
+  | otherwise = bracketed <> ":" <> show substratePort
+  where
+    defaultPort = maybe 80 (const 443) substrateTls
+    bracketed | ':' `elem` substrateHost = "[" <> substrateHost <> "]"  -- an IPv6 literal
+              | otherwise = substrateHost
 
 -- | Build a Cookie header from a JWT token
 cookieHeader :: Text -> WS.Headers
@@ -171,9 +215,16 @@ connect SubstrateConfig{..} = do
 
   -- Run WebSocket client in a background thread
   -- Catch exceptions inside the thread to prevent them from being printed
+  -- SCAFFOLD-21: over TLS when the config says wss
+  let dial :: (Connection -> IO ()) -> IO ()
+      dial = case substrateTls of
+        Nothing -> WS.runClientWith substrateHost substratePort substratePath
+                     opts substrateHeaders
+        Just tls -> \app -> withTlsStream substrateHost substratePort tls $ \stream ->
+          WS.runClientWithStream stream (hostHeader SubstrateConfig{..}) substratePath
+            opts substrateHeaders app
   tid <- forkIO $
-    (WS.runClientWith substrateHost substratePort substratePath
-        opts substrateHeaders $ \conn -> do
+    (dial $ \conn -> do
       reader <- async $
         readerLoop conn touch subs pendingReqs
           `catch` (\(e :: SomeException) -> lose (describeEnd e))
@@ -203,6 +254,76 @@ connect SubstrateConfig{..} = do
         , scClosed        = closed
         , scKeepalive     = kat
         }
+
+-- | SCAFFOLD-21: a TLS stream to @host:port@ for the action — the TCP
+-- connection to the first address that answers, the handshake with the
+-- name sent as SNI, the certificate chain verified against the system's
+-- trust store and 'tlsCaFiles', and the name against the certificate. A
+-- failed check fails the handshake (an exception, as a refused dial is).
+withTlsStream :: String -> Int -> TlsOptions -> (WSS.Stream -> IO a) -> IO a
+withTlsStream host port TlsOptions{..} act = do
+  store <- trustStore tlsCaFiles
+  let base = TLS.defaultParamsClient host (BS8.pack (show port))
+      params = base
+        { TLS.clientShared = (TLS.clientShared base) { TLS.sharedCAStore = store } }
+  sock <- openTcp host port
+  flip finally (S.close sock) $ do
+    ctx <- TLS.contextNew sock params
+    TLS.handshake ctx
+    let recv = do
+          chunk <- TLS.recvData ctx
+          pure (if BS.null chunk then Nothing else Just chunk)
+        send = maybe (TLS.bye ctx `catch` \(_ :: SomeException) -> pure ())
+                     (TLS.sendData ctx)
+    stream <- WSS.makeStream recv send
+    act stream `finally` WSS.close stream
+
+-- | The certificates a @wss://@ server's chain may end in: the system's
+-- and those in each PEM file named. A file that holds none is an error
+-- (a mistyped path would otherwise only show as a failed handshake).
+trustStore :: [FilePath] -> IO CertificateStore
+trustStore files = do
+  system <- systemStore
+  extra <- mapM readCa files
+  pure (system <> makeCertificateStore (concat extra))
+  where
+    readCa f = do
+      r <- try (readSignedObject f)
+      case r of
+        Left (e :: SomeException) -> ioError (userError ("CA file " <> f <> ": " <> show e))
+        Right [] -> ioError (userError ("CA file " <> f <> " holds no PEM certificate"))
+        Right certs -> pure certs
+
+-- | The system's trust store, read once per process (every connection of
+-- a pool would otherwise read the bundle again).
+systemStore :: IO CertificateStore
+systemStore = modifyMVar systemStoreMemo $ \case
+  Just st -> pure (Just st, st)
+  Nothing -> do
+    st <- getSystemCertificateStore
+    pure (Just st, st)
+
+{-# NOINLINE systemStoreMemo #-}
+systemStoreMemo :: MVar (Maybe CertificateStore)
+systemStoreMemo = unsafePerformIO (newMVar Nothing)
+
+-- | A TCP connection to the first of @host@'s addresses that takes it.
+openTcp :: String -> Int -> IO S.Socket
+openTcp host port = do
+  let hints = S.defaultHints { S.addrSocketType = S.Stream }
+  addrs <- S.getAddrInfo (Just hints) (Just host) (Just (show port))
+  let attempt [] = ioError (userError ("no address of " <> host <> " answered"))
+      attempt (a : rest) = do
+        r <- try $ bracketOnError (S.openSocket a) S.close $ \s -> do
+          S.setSocketOption s S.NoDelay 1
+          S.connect s (S.addrAddress a)
+          pure s
+        case r of
+          Right s -> pure s
+          Left (e :: SomeException)
+            | null rest -> throwIO e
+            | otherwise -> attempt rest
+  attempt addrs
 
 -- | SYNAPSE-20: ping after 'kaIdle' seconds of silence; when nothing is
 -- heard 'kaTimeout' seconds after the ping, the connection is lost — the
