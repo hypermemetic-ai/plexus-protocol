@@ -10,6 +10,7 @@ module Plexus.Transport
     -- * RPC Calls (streaming)
   , rpcCallStreaming
   , invokeMethodStreaming
+  , invokeMethodStreamingWith
 
     -- * Bidirectional Response
   , sendBidirectionalResponse
@@ -37,7 +38,7 @@ import qualified Streaming.Prelude as S
 import qualified Network.Socket as NS
 import System.IO.Unsafe (unsafePerformIO)
 
-import Plexus.Client (SubstrateConfig(..), connect, disconnect, substrateRpc, defaultConfig)
+import Plexus.Client (SubstrateConfig(..), LostConnection(..), connect, disconnect, substrateRpc, substrateRpcWith, defaultConfig)
 import Plexus.Client.Pool (ConnectionPool, createConnectionPool, withPooledConnection, defaultPlexusPoolConfig)
 import Plexus.Types (PlexusStreamItem(..), TransportError(..), Response(..), StandardResponse)
 import Plexus.Schema.Recursive (PluginSchema, MethodSchema, SchemaResult(..), parsePluginSchema, parseSchemaResult)
@@ -71,6 +72,9 @@ rpcCallWith cfg method params = do
 -- | Categorize exceptions into typed TransportError
 categorizeException :: SubstrateConfig -> SomeException -> IO (Either TransportError a)
 categorizeException cfg e
+  -- SYNAPSE-20: the connection went while the call was on it
+  | Just (LostConnection why sent) <- fromException e =
+      pure $ Left $ ConnectionLost why sent
   -- Check for connection refused (most common)
   | Just ioErr <- fromException e :: Maybe IOException = do
       let errMsg = show ioErr
@@ -87,7 +91,14 @@ categorizeException cfg e
       let errMsg = show e
           host = T.pack $ substrateHost cfg
           port = substratePort cfg
-      in pure $ Left $ if "protocol" `isInfixOf` errMsg || "parse" `isInfixOf` errMsg
+      in pure $ Left $
+        -- SYNAPSE-20: 'connect' reports a refused or timed-out dial as an
+        -- error call; say which, so a caller can tell an outage from a fault
+        if "refused" `isInfixOf` errMsg || "ECONNREFUSED" `isInfixOf` errMsg
+          then ConnectionRefused host port
+        else if "Connection timeout" `isInfixOf` errMsg
+          then ConnectionTimeout host port
+        else if "protocol" `isInfixOf` errMsg || "parse" `isInfixOf` errMsg
         then ProtocolError (T.pack errMsg)
         else NetworkError (T.pack errMsg)
 
@@ -96,10 +107,18 @@ categorizeException cfg e
     on f g x y = f (g x) (g y)
 
 doCallInner :: SubstrateConfig -> Text -> Value -> IO [PlexusStreamItem]
-doCallInner cfg method params = do
+doCallInner cfg method params = freshIfUnsent $ do
   pool <- getOrCreatePool cfg
   withPooledConnection pool $ \conn ->
     S.toList_ $ substrateRpc conn method params
+
+-- | SYNAPSE-20: a pooled connection that died while idle fails the call
+-- before anything is sent (and the pool drops it); the call goes once more,
+-- on a fresh connection. A call whose request went out is never repeated
+-- here — whether that is safe is the caller's to say.
+freshIfUnsent :: IO a -> IO a
+freshIfUnsent act = act `E.catch` \(e :: LostConnection) ->
+  if lostSent e then E.throwIO e else act
 
 -- | Streaming RPC call - invokes callback for each item as it arrives
 rpcCallStreaming :: SubstrateConfig -> Text -> Value -> (PlexusStreamItem -> IO ()) -> IO (Either TransportError ())
@@ -109,19 +128,28 @@ rpcCallStreaming cfg method params onItem = do
   pure result
 
 doCallStreaming :: SubstrateConfig -> Text -> Value -> (PlexusStreamItem -> IO ()) -> IO ()
-doCallStreaming cfg method params onItem = do
+doCallStreaming cfg = doCallStreamingWith cfg (pure ())
+
+doCallStreamingWith :: SubstrateConfig -> IO () -> Text -> Value -> (PlexusStreamItem -> IO ()) -> IO ()
+doCallStreamingWith cfg onSubscribed method params onItem = freshIfUnsent $ do
   pool <- getOrCreatePool cfg
   withPooledConnection pool $ \conn ->
-    S.mapM_ onItem $ substrateRpc conn method params
+    S.mapM_ onItem $ substrateRpcWith conn onSubscribed method params
 
 -- | Streaming method invocation
 invokeMethodStreaming :: SubstrateConfig -> [Text] -> Text -> Value -> (PlexusStreamItem -> IO ()) -> IO (Either TransportError ())
-invokeMethodStreaming cfg namespacePath method params onItem = do
+invokeMethodStreaming cfg = invokeMethodStreamingWith cfg (pure ())
+
+-- | SYNAPSE-20: 'invokeMethodStreaming', telling @onSubscribed@ when the
+-- server has taken the call, before any item.
+invokeMethodStreamingWith :: SubstrateConfig -> IO () -> [Text] -> Text -> Value -> (PlexusStreamItem -> IO ()) -> IO (Either TransportError ())
+invokeMethodStreamingWith cfg onSubscribed namespacePath method params onItem = do
   let backend = substrateBackend cfg
   let fullPath = if null namespacePath then [backend] else namespacePath
   let dotPath = T.intercalate "." (fullPath ++ [method])
   let callParams = object ["method" .= dotPath, "params" .= params]
-  rpcCallStreaming cfg (backend <> ".call") callParams onItem
+  (Right <$> doCallStreamingWith cfg onSubscribed (backend <> ".call") callParams onItem)
+    `catch` categorizeException cfg
 
 -- | Fetch schema at a specific path
 -- Empty path = root (<backend>.schema)

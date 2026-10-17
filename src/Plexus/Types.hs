@@ -291,6 +291,15 @@ data TransportError
   | NetworkError
       { transportMessage :: Text
       }
+  -- | SYNAPSE-20: an open connection was lost (the server closed it, it was
+  -- reset, or a keepalive ping went unanswered) while a call was on it.
+  -- 'transportSent' says whether the call's request had been sent: when it
+  -- had not, repeating the call is always safe; when it had, the server
+  -- may have acted on it.
+  | ConnectionLost
+      { transportMessage :: Text
+      , transportSent    :: Bool
+      }
   deriving stock (Show, Eq, Generic)
 
 instance ToJSON TransportError where
@@ -312,6 +321,11 @@ instance ToJSON TransportError where
     [ "error_kind" .= ("network_error" :: Text)
     , "message" .= msg
     ]
+  toJSON (ConnectionLost msg sent) = object
+    [ "error_kind" .= ("connection_lost" :: Text)
+    , "message" .= msg
+    , "sent" .= sent
+    ]
 
 instance FromJSON TransportError where
   parseJSON = withObject "TransportError" $ \o -> do
@@ -321,6 +335,7 @@ instance FromJSON TransportError where
       "connection_timeout" -> ConnectionTimeout <$> o .: "host" <*> o .: "port"
       "protocol_error" -> ProtocolError <$> o .: "message"
       "network_error" -> NetworkError <$> o .: "message"
+      "connection_lost" -> ConnectionLost <$> o .: "message" <*> o .: "sent"
       _ -> fail $ "Unknown transport error_kind: " <> T.unpack kind
 
 -- ============================================================================
