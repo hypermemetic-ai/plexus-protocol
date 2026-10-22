@@ -22,6 +22,8 @@ module Plexus.Client
     -- * Core RPC primitive
   , substrateRpc
   , substrateRpcWith
+  , substrateRpcSub
+  , unsubscribe
 
     -- * Configuration
   , SubstrateConfig(..)
@@ -350,6 +352,40 @@ keepaliveLoop Keepalive{..} conn heard closed reader = go Nothing
                 go (Just now)
             | otherwise -> go Nothing
 
+-- | SYNAPSE-28: end a subscription the caller no longer reads — the
+-- server's @unsubMethod@ (@<backend>.call_unsub@) with its id, as the
+-- server gave it (a number stays a number). The answer is not waited for;
+-- nothing more is delivered to the call's queue.
+unsubscribe :: SubstrateConnection -> Text -> SubscriptionId -> IO ()
+unsubscribe conn unsubMethod subId = do
+  atomically $ modifyTVar' (scSubscriptions conn) (Map.delete subId)
+  gone <- connectionLost conn
+  case gone of
+    Just _ -> pure ()
+    Nothing -> do
+      rid <- atomicModifyIORef' (scNextId conn) $ \n -> (n + 1, RequestId n)
+      -- the answer is taken and dropped by the reader (a pending request
+      -- no one waits on)
+      queue <- newTQueueIO
+      respVar <- newEmptyTMVarIO
+      atomically $ modifyTVar' (scPendingReqs conn) (Map.insert rid (PendingRequest queue respVar))
+      let raw = unSubscriptionId subId
+          idValue = case decodeStrictText raw of
+            Just n@(Number _) -> n
+            _ -> String raw
+          req = object
+            [ "jsonrpc" .= ("2.0" :: Text), "id" .= rid
+            , "method" .= unsubMethod, "params" .= [idValue] ]
+      WS.sendTextData (scConnection conn) (encode req)
+        `catch` \(_ :: SomeException) -> pure ()
+      -- forget it shortly; the reader has filled respVar by then, or never will
+      void $ forkIO $ do
+        threadDelay 30000000
+        atomically $ modifyTVar' (scPendingReqs conn) (Map.delete rid)
+  where
+    decodeStrictText :: Text -> Maybe Value
+    decodeStrictText = decode . LBS.fromStrict . BS8.pack . T.unpack
+
 -- | Disconnect from substrate
 disconnect :: SubstrateConnection -> IO ()
 disconnect SubstrateConnection{..} = do
@@ -452,7 +488,19 @@ substrateRpcWith
   -> Text
   -> Value
   -> Stream (Of PlexusStreamItem) IO ()
-substrateRpcWith conn onSubscribed method params = do
+substrateRpcWith conn onSubscribed = substrateRpcSub conn (const onSubscribed)
+
+-- | SYNAPSE-28: 'substrateRpcWith', telling @onSubscribed@ the
+-- subscription's id — so a caller that shares the connection (a holder
+-- serving many calls on one socket) can end a call it abandons with
+-- 'unsubscribe'.
+substrateRpcSub
+  :: SubstrateConnection
+  -> (SubscriptionId -> IO ())
+  -> Text
+  -> Value
+  -> Stream (Of PlexusStreamItem) IO ()
+substrateRpcSub conn onSubscribed method params = do
   -- SYNAPSE-20: a connection already gone (it died idle in a pool) takes
   -- no request; nothing was sent, so the caller may always try again
   gone <- liftIO $ connectionLost conn
@@ -507,7 +555,7 @@ substrateRpcWith conn onSubscribed method params = do
           pure ()
 
         Success subId -> do
-          liftIO onSubscribed
+          liftIO (onSubscribed subId)
           -- Stream items until done, cleanup when finished
           streamItems queue subId <* liftIO (cleanup subId)
   where

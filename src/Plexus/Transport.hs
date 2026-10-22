@@ -24,11 +24,16 @@ module Plexus.Transport
     -- * Method Invocation (collected)
   , invokeMethod
   , invokeRaw
+
+    -- * Routing a call elsewhere (SYNAPSE-28)
+  , CallRoute
+  , setCallRouter
   ) where
 
 import Control.Exception (SomeException, IOException, catch, fromException)
 import qualified Control.Exception as E
 import Control.Concurrent.MVar (MVar, newMVar, modifyMVar)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef')
 import Data.Aeson hiding (Error)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -57,6 +62,24 @@ getOrCreatePool cfg = modifyMVar poolCache $ \pools ->
     Nothing -> do
       pool <- createConnectionPool cfg defaultPlexusPoolConfig
       pure (Map.insert cfg pool pools, pool)
+
+-- | SYNAPSE-28: one call, made some other way than a pooled connection of
+-- this process — @onSubscribed method params onItem@ — e.g. through a
+-- connection held between runs, or one connection a whole process shares.
+-- It reports a lost connection as 'Plexus.Client.connect' and
+-- 'substrateRpcWith' do ('LostConnection', a failed dial as an error
+-- call), so everything above it reads its failures as before.
+type CallRoute = IO () -> Text -> Value -> (PlexusStreamItem -> IO ()) -> IO ()
+
+{-# NOINLINE routerRef #-}
+routerRef :: IORef (SubstrateConfig -> Maybe CallRoute)
+routerRef = unsafePerformIO (newIORef (const Nothing))
+
+-- | SYNAPSE-28: route the calls whose config the router answers 'Just'
+-- for; the rest go through this process's pools, as before. Set once, at
+-- start (a program that never sets it is unchanged).
+setCallRouter :: (SubstrateConfig -> Maybe CallRoute) -> IO ()
+setCallRouter = writeIORef routerRef
 
 -- | Low-level RPC call with default localhost config
 rpcCall :: Text -> Text -> Value -> IO (Either TransportError [PlexusStreamItem])
@@ -107,10 +130,17 @@ categorizeException cfg e
     on f g x y = f (g x) (g y)
 
 doCallInner :: SubstrateConfig -> Text -> Value -> IO [PlexusStreamItem]
-doCallInner cfg method params = freshIfUnsent $ do
-  pool <- getOrCreatePool cfg
-  withPooledConnection pool $ \conn ->
-    S.toList_ $ substrateRpc conn method params
+doCallInner cfg method params = do
+  router <- readIORef routerRef
+  case router cfg of
+    Just route -> do
+      acc <- newIORef []
+      route (pure ()) method params (\i -> modifyIORef' acc (i :))
+      reverse <$> readIORef acc
+    Nothing -> freshIfUnsent $ do
+      pool <- getOrCreatePool cfg
+      withPooledConnection pool $ \conn ->
+        S.toList_ $ substrateRpc conn method params
 
 -- | SYNAPSE-20: a pooled connection that died while idle fails the call
 -- before anything is sent (and the pool drops it); the call goes once more,
@@ -131,10 +161,14 @@ doCallStreaming :: SubstrateConfig -> Text -> Value -> (PlexusStreamItem -> IO (
 doCallStreaming cfg = doCallStreamingWith cfg (pure ())
 
 doCallStreamingWith :: SubstrateConfig -> IO () -> Text -> Value -> (PlexusStreamItem -> IO ()) -> IO ()
-doCallStreamingWith cfg onSubscribed method params onItem = freshIfUnsent $ do
-  pool <- getOrCreatePool cfg
-  withPooledConnection pool $ \conn ->
-    S.mapM_ onItem $ substrateRpcWith conn onSubscribed method params
+doCallStreamingWith cfg onSubscribed method params onItem = do
+  router <- readIORef routerRef
+  case router cfg of
+    Just route -> route onSubscribed method params onItem
+    Nothing -> freshIfUnsent $ do
+      pool <- getOrCreatePool cfg
+      withPooledConnection pool $ \conn ->
+        S.mapM_ onItem $ substrateRpcWith conn onSubscribed method params
 
 -- | Streaming method invocation
 invokeMethodStreaming :: SubstrateConfig -> [Text] -> Text -> Value -> (PlexusStreamItem -> IO ()) -> IO (Either TransportError ())

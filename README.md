@@ -47,6 +47,21 @@ let cfg = (defaultConfig "hostdemo")
 Right items <- rpcCallWith cfg "_info" Null
 ```
 
+### Routing calls (SYNAPSE-28, 0.5.3.0)
+
+`Plexus.Transport.setCallRouter` sends the calls whose config the router
+answers `Just` for some other way than this process's pools — synapse uses
+it to put every call of a run through a connection held between runs, or
+through one connection the run shares. A route reports failures as
+`connect` and `substrateRpcWith` do (`LostConnection` with whether the
+request had gone out; a failed dial as an error call), so everything above
+it reads them as before. A program that never sets it is unchanged.
+
+`Plexus.Client.substrateRpcSub` is `substrateRpcWith` telling the caller the
+subscription's id, and `unsubscribe conn "<backend>.call_unsub" sid` ends a
+call it no longer reads (a number id is sent as a number) — for a connection
+shared by many calls, where one abandoned must not keep streaming.
+
 ### Schema Fetching
 
 ```haskell
