@@ -493,7 +493,7 @@ data PlexusStreamItem
       , itemRecoverable :: Bool
       , itemErrorRefusal :: Maybe Refusal
         -- ^ AUTH-2: @error_kind: "forbidden"@ and what it names; Nothing
-        -- for every other error (and on every hub without a gate)
+        -- for every other error (and on every service without a gate)
       }
   | StreamRequest
       { itemPlexusHash  :: Text
@@ -628,7 +628,7 @@ instance ToJSON PlexusStreamItem where
     , "recoverable" .= rec
     ] <> refusalFields
     where
-      -- the refusal's own fields, beside the message (as the hub sent them)
+      -- the refusal's own fields, beside the message (as the service sent them)
       refusalFields = case toJSON <$> refusal of
         Just (Object ro) -> [ (k, v) | (k, v) <- KM.toList ro, k /= "message" ]
         _ -> []

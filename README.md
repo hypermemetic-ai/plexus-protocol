@@ -32,7 +32,7 @@ main = do
 
 ### wss (SCAFFOLD-21, 0.5.2.0)
 
-A hub behind TLS (a hosted app: `wss://<host>/ws`) is dialed when
+A service behind TLS (a hosted app: `wss://<host>/ws`) is dialed when
 `substrateTls` is `Just`: the `tls` package over a TCP socket, SNI and the
 name check against `substrateHost`, the chain against the system's trust
 store (crypton-x509-system; `SYSTEM_CERTIFICATE_PATH` overrides it) plus each
@@ -187,8 +187,14 @@ src/
 
 ```bash
 cabal build
-cabal test
+cabal test                    # test-suite naming-gate
+scripts/naming-gate.sh        # the naming gate: each line that says the retired word (-c: the count)
 ```
+
+A Plexus backend is a *service*, and an activation with children a *parent*
+(`isParentActivation`; NAMING-9, `~/AGENTS.md` "Naming"). The suite runs the
+gate, which passes only lines marked `naming-alias`: the deprecated old name of
+`isParentActivation`, kept until NAMING-18.
 
 ## License
 
