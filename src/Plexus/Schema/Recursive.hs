@@ -49,7 +49,8 @@ module Plexus.Schema.Recursive
   , xPlexusValues
 
     -- * Queries
-  , isHubActivation
+  , isParentActivation
+  , isHubActivation    -- naming-alias: deprecated, removed by NAMING-18
   , isLeafActivation
   , pluginMethods
   , pluginChildren
@@ -252,7 +253,7 @@ instance FromJSON MethodSchema where
     <*> o .:? "target"
     <*> o .:? "held_on"
     <*> o .:? "public" .!= False
-    -- SYNAPSE-13: absent on an older hub; an unreadable one is ignored
+    -- SYNAPSE-13: absent on an older service; an unreadable one is ignored
     <*> (o .:? "group" <|> pure Nothing)
     <*> (o .:? "examples" .!= [] <|> pure [])
     <*> o .:? "input"
@@ -323,7 +324,7 @@ data PluginSchema = PluginSchema
   , psLongDescription :: Maybe Text  -- ^ Extended description (no word limit)
   , psHash            :: PluginHash
   , psMethods         :: [MethodSchema]
-  , psChildren        :: Maybe [ChildSummary]  -- ^ Nothing = leaf, Just = hub activation
+  , psChildren        :: Maybe [ChildSummary]  -- ^ Nothing = leaf, Just = parent activation
   , psDeprecation     :: Maybe DeprecationInfo -- ^ Activation-level deprecation (IR-5)
   , psRoles           :: Maybe (Map Text [Text]) -- ^ AUTH-3: the activation's default roles, each its grants
   , psView            :: Maybe View            -- ^ AUTH-4: which view this schema answers from
@@ -385,13 +386,18 @@ instance ToJSON SchemaResult where
 hasAuthColumns :: PluginSchema -> Bool
 hasAuthColumns ps = any (\m -> maybe False (const True) (methodGrant m) || maybe False (const True) (methodHeldOn m)) (psMethods ps)
 
--- | Is this a hub activation (has children)?
-isHubActivation :: PluginSchema -> Bool
-isHubActivation = maybe False (not . null) . psChildren
+-- | Is this a parent activation (has children)?
+isParentActivation :: PluginSchema -> Bool
+isParentActivation = maybe False (not . null) . psChildren
 
 -- | Is this a leaf activation (no children)?
 isLeafActivation :: PluginSchema -> Bool
-isLeafActivation = not . isHubActivation
+isLeafActivation = not . isParentActivation
+
+-- | The old name of 'isParentActivation', kept for one release. -- naming-alias: removed by NAMING-18
+{-# DEPRECATED isHubActivation "renamed isParentActivation — NAMING" #-} -- naming-alias
+isHubActivation :: PluginSchema -> Bool -- naming-alias
+isHubActivation = isParentActivation -- naming-alias
 
 -- | Get methods (alias for psMethods)
 pluginMethods :: PluginSchema -> [MethodSchema]

@@ -1,7 +1,7 @@
--- | AUTH-4 / AUTH-2 / AUTH-5: what a client parses of a hub's auth.
+-- | AUTH-4 / AUTH-2 / AUTH-5: what a client parses of a service's auth.
 --
--- Every field is optional on the wire: a hub without a gate (every hub
--- before AUTH, and any hub that leaves login off) answers none of it, and
+-- Every field is optional on the wire: a service without a gate (every service
+-- before AUTH, and any service that leaves login off) answers none of it, and
 -- everything here parses its absence as 'Nothing' or empty.
 --
 -- * '_info' gains @view@ (@anonymous@ | @caller@), the view's @hash@, and,
@@ -36,7 +36,7 @@ import GHC.Generics (Generic)
 -- The view
 -- ============================================================================
 
--- | Which part of a hub the caller sees: an anonymous caller only how to
+-- | Which part of a service the caller sees: an anonymous caller only how to
 -- sign in; a signed-in caller what it can use.
 data View = Anonymous | Caller
   deriving stock (Show, Eq, Ord, Generic)
@@ -46,7 +46,7 @@ viewText Anonymous = "anonymous"
 viewText Caller = "caller"
 
 -- | @"anonymous"@ / @"caller"@, or an object naming it as @kind@ (a
--- tolerance: a hub may carry the view's hash beside it).
+-- tolerance: a service may carry the view's hash beside it).
 instance FromJSON View where
   parseJSON = \case
     String s -> fromName s
@@ -82,7 +82,7 @@ instance ToJSON AuthInfo where
 -- | What @_info@ answers. Only @backend@ is required.
 data BackendInfo = BackendInfo
   { infoBackend  :: Text
-  , infoView     :: Maybe View   -- ^ Nothing: a hub with no gate (today's)
+  , infoView     :: Maybe View   -- ^ Nothing: a service with no gate (today's)
   , infoViewHash :: Maybe Text   -- ^ the view's own hash (@view_hash@, else @hash@, else the view object's @hash@)
   , infoAuth     :: Maybe AuthInfo
   }
@@ -132,7 +132,7 @@ data Refusal = Refusal
   , refusalScope   :: Maybe Text   -- ^ where it was asked: @IDENTITY@
   , refusalRoles   :: [Text]       -- ^ the roles that list the grant
   , refusalHeldOn  :: [Text]       -- ^ where the caller holds it
-  , refusalCeiling :: [Text]       -- ^ the session's ceiling, when the hub says it
+  , refusalCeiling :: [Text]       -- ^ the session's ceiling, when the service says it
   , refusalMessage :: Text
   }
   deriving stock (Show, Eq, Generic)

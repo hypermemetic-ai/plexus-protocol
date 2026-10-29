@@ -1,24 +1,24 @@
-# Multi-Hub Architecture with PlexusStreamItem Transport Envelope
+# Multi-Service Architecture with PlexusStreamItem Transport Envelope
 
 ## TL;DR
 
-**Goal:** Unify the wire format and naming conventions across all hubs, preparing for multi-backend architecture.
+**Goal:** Unify the wire format and naming conventions across all services, preparing for multi-backend architecture.
 
 **Key Changes:**
 1. `plexus_call` → `{backend}.call` (backend-namespaced dot notation)
 2. Synapse CLI: `synapse echo once` → `synapse plexus echo once` (explicit backend)
-3. Remove `CallEvent` wrapper - return `PlexusStreamItem` directly from `hub.call`
+3. Remove `CallEvent` wrapper - return `PlexusStreamItem` directly from `service.call`
 4. Every response on the wire is `PlexusStreamItem` (uniform envelope)
 
 **Affected Codebases:**
 | Codebase | Changes |
 |----------|---------|
-| hub-core | Remove CallEvent, plexus.call returns PlexusStreamItem directly |
-| hub-macro | Rename generated RPC from `_` to `.` notation |
+| plexus-core | Remove CallEvent, plexus.call returns PlexusStreamItem directly |
+| plexus-macros | Rename generated RPC from `_` to `.` notation |
 | substrate | Update RPC registration for dot notation |
 | substrate-protocol | Change `"plexus_call"` → `"{backend}.call"` in Transport.hs |
 | synapse | Add backend as first path segment, remove CallEvent unwrap |
-| hub-codegen | Add PlexusStreamItem to IR, two-layer generation |
+| service-codegen | Add PlexusStreamItem to IR, two-layer generation |
 
 **Wire Format (after changes):**
 ```json
@@ -34,7 +34,7 @@
 ```bash
 synapse plexus echo once --message hi      # explicit backend
 synapse plexus solar earth luna info       # nested routing
-synapse otherhub some method               # future: other backends
+synapse otherservice some method               # future: other backends
 ```
 
 **PlexusStreamItem (the universal envelope):**
@@ -77,7 +77,7 @@ pub struct StreamMetadata {
 
 ## Vision
 
-Move from a single Plexus hub to multiple spawnable hub backends, each serving as an independent routing layer. All hubs share a common wire format: `PlexusStreamItem`.
+Move from a single Plexus service to multiple spawnable service backends, each serving as an independent routing layer. All services share a common wire format: `PlexusStreamItem`.
 
 ## Namespace Consistency
 
@@ -113,17 +113,17 @@ synapse plexus solar earth luna info
 
 # Future: multiple backends
 synapse plexus echo once --message hi     # plexus backend on :4444
-synapse otherhub foo bar                   # different backend on :5555
+synapse otherservice foo bar                   # different backend on :5555
 synapse arbor-cluster node list            # another backend
 ```
 
 ### Backend Discovery
 
-A hub can host other backends as subplugins while those backends remain independently accessible:
+A service can host other backends as subplugins while those backends remain independently accessible:
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  Orchestrator Hub                               │
+│  Orchestrator Service                               │
 │  Exposes: backends.list, backends.info          │
 │  Returns connection info for each backend       │
 ├─────────────────────────────────────────────────┤
@@ -186,7 +186,7 @@ Or direct method call (still routed through `{backend}.call` internally):
 **Problems:**
 - `CallEvent` is redundant (PlexusStreamItem minus metadata)
 - Double-wrapping: DomainEvent → PlexusStreamItem → CallEvent → PlexusStreamItem
-- Only specific backends have `call` - needs to be uniform across hubs
+- Only specific backends have `call` - needs to be uniform across services
 - Synapse needs special unwrap logic for CallEvent
 
 ## Target Architecture
@@ -198,10 +198,10 @@ Or direct method call (still routed through `{backend}.call` internally):
 │  Generated wrappers unwrap PlexusStreamItem.Data.content│
 ├─────────────────────────────────────────────────────────┤
 │  RPC Transport Layer                                    │
-│  hub.call(method, params): AsyncGenerator<PlexusStreamItem>│
-│  Uniform across all hubs                                │
+│  service.call(method, params): AsyncGenerator<PlexusStreamItem>│
+│  Uniform across all services                                │
 ├─────────────────────────────────────────────────────────┤
-│  Hub Backend (spawnable, one of many)                   │
+│  Service Backend (spawnable, one of many)                   │
 │  Routes to activations                                  │
 │  All responses are PlexusStreamItem                     │
 └─────────────────────────────────────────────────────────┘
@@ -230,7 +230,7 @@ This is already true - `wrap_stream` produces this. The change is making it expl
 
 ### 2. Remove CallEvent
 
-`{backend}.call` (any hub's `call` method) returns `PlexusStreamItem` directly:
+`{backend}.call` (any service's `call` method) returns `PlexusStreamItem` directly:
 
 ```rust
 // Before
@@ -257,16 +257,16 @@ async fn call(&self, method: String, params: Option<Value>) -> impl Stream<Item 
 }
 ```
 
-### 3. Every Hub Exposes `call`
+### 3. Every Service Exposes `call`
 
 The `call` method becomes universal to all plugins that can route:
 
 | Plugin Type | Has `call` | Behavior |
 |-------------|------------|----------|
 | Leaf (echo, health) | No | Direct method invocation only |
-| Hub (solar, plexus) | Yes | Routes to children via `call` |
+| Parent (solar, plexus) | Yes | Routes to children via `call` |
 
-Hubs implement `ChildRouter` and expose `call`. The macro could auto-generate this for `hub = true` plugins.
+Parents implement `ChildRouter` and expose `call`. The macro could auto-generate this for `parent = true` plugins.
 
 ### 4. IR Changes
 
@@ -305,7 +305,7 @@ PlexusStreamItem becomes a first-class type:
 
 **Layer 1: RPC Client (raw)**
 ```typescript
-interface HubRpcClient {
+interface ServiceRpcClient {
   call(method: string, params?: unknown): AsyncGenerator<PlexusStreamItem>;
 }
 ```
@@ -318,7 +318,7 @@ interface EchoClient {
 
 // Generated implementation
 class EchoClientImpl implements EchoClient {
-  constructor(private rpc: HubRpcClient) {}
+  constructor(private rpc: ServiceRpcClient) {}
 
   async once(params: { message: string }): Promise<EchoEvent> {
     const stream = this.rpc.call("echo.once", params);
@@ -350,13 +350,13 @@ async *chat(params: ChatParams): AsyncGenerator<ChatEvent> {
 }
 ```
 
-## Multi-Hub Spawning
+## Multi-Service Spawning
 
-Each hub backend is an independent process:
+Each service backend is an independent process:
 
 ```
 ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│  Hub A       │  │  Hub B       │  │  Hub C       │
+│  Service A       │  │  Service B       │  │  Service C       │
 │  :4444       │  │  :4445       │  │  :4446       │
 │  - echo      │  │  - cone      │  │  - arbor     │
 │  - health    │  │  - claudecode│  │  - changelog │
@@ -368,11 +368,11 @@ Each hub backend is an independent process:
             │  Orchestrator │
             │  Routes to    │
             │  appropriate  │
-            │  hub backend  │
+            │  service backend  │
             └───────────────┘
 ```
 
-Each hub:
+Each service:
 - Has its own `call` method
 - Returns `PlexusStreamItem` uniformly
 - Can be spawned/scaled independently
@@ -405,7 +405,7 @@ Each hub:
 }}
 ```
 
-### Example 2: One-Level Nesting (Hub → Child)
+### Example 2: One-Level Nesting (Parent → Child)
 
 **Request:** `solar.observe`
 ```json
@@ -426,7 +426,7 @@ Each hub:
 {"type": "done", "metadata": {"provenance": ["solar"], "plexus_hash": "abc123", "timestamp": 1234567890}}
 ```
 
-### Example 3: Two-Level Nesting (Hub → Child → Grandchild)
+### Example 3: Two-Level Nesting (Parent → Child → Grandchild)
 
 **Request:** `solar.earth.info`
 ```json
@@ -447,7 +447,7 @@ Each hub:
 {"type": "done", "metadata": {"provenance": ["solar", "earth"], "plexus_hash": "abc123", "timestamp": 1234567890}}
 ```
 
-### Example 4: Three-Level Nesting (Hub → Child → Grandchild → Method)
+### Example 4: Three-Level Nesting (Parent → Child → Grandchild → Method)
 
 **Request:** `solar.earth.luna.info`
 ```json
@@ -549,7 +549,7 @@ pub enum MyEnum {
 
 **Why this matters:** The internally-tagged format puts the discriminant inline with the data, making it possible to parse the enum without prior knowledge of all variants. Adjacently-tagged format wraps the variant name as a key around the data, which is incompatible with synapse's IR Builder parser.
 
-**Future:** hub-macro should enforce this at compile time or emit warnings for enums without `#[serde(tag = "type")]`.
+**Future:** plexus-macros should enforce this at compile time or emit warnings for enums without `#[serde(tag = "type")]`.
 
 ### CLI Parameter Validation
 
@@ -565,7 +565,7 @@ pub enum MyEnum {
 
 ## Implementation Notes: Codegen Pipeline Fixes (Completed)
 
-### 1. Hub-macro $defs Extraction (commit `cdd9ebf`)
+### 1. Plexus-macros $defs Extraction (commit `cdd9ebf`)
 
 **Problem:** Method parameter schemas were extracted from the root schema without including their `$defs` section. This left type references unresolved at the IR level.
 
@@ -582,7 +582,7 @@ For example, a method using `ConeIdentifier` would receive:
 
 **Root cause:** The `method_enum.rs` codegen only extracted the relevant `properties` but not the supporting `$defs` that defined custom types.
 
-**Solution:** Modified `/Users/user/dev/controlflow/hypermemetic/hub-macro/src/codegen/method_enum.rs` to:
+**Solution:** Modified `/Users/user/dev/controlflow/hypermemetic/plexus-macros/src/codegen/method_enum.rs` to:
 1. Extract the method's param schema as before
 2. Look up the root schema's `$defs` section
 3. Merge all definitions into the method's schema
@@ -652,7 +652,7 @@ synapse plexus -i
     ↓
 Synapse IR (types, methods)
     ↓
-hub-codegen
+service-codegen
     ↓
 TypeScript client (type-safe)
     ↓
@@ -661,12 +661,12 @@ npx tsc --noEmit ✓ (compiles)
 
 **Verification:**
 - `synapse plexus -i` generates IR from schema
-- `hub-codegen` generates TypeScript client from IR
+- `service-codegen` generates TypeScript client from IR
 - `npx tsc --noEmit` compiles without errors
 - Minor warning for `SchemaResult` type (health plugin) - harmless
 
 **Next steps:**
-- Sync these fixes to hub-core, substrate-protocol, and synapse repositories
+- Sync these fixes to plexus-core, substrate-protocol, and synapse repositories
 - Update any other enums in the codebase to use internally-tagged format
 - Document the enum tagging requirement in contributing guidelines
 
@@ -686,8 +686,8 @@ npx tsc --noEmit ✓ (compiles)
 7. **Remove synapse unwrap** - PlexusStreamItem is already the expected type
 
 ### Phase 3: Two-Layer Codegen
-8. **Update hub-codegen** for two-layer generation (RPC + typed wrappers)
-9. **Add `call` to hub-macro** for `hub = true` plugins
+8. **Update service-codegen** for two-layer generation (RPC + typed wrappers)
+9. **Add `call` to plexus-macros** for `parent = true` plugins
 
 ### Phase 4: Multi-Backend (Future)
 10. **Backend discovery** - orchestrator exposes `backends.list`, `backends.info`
@@ -698,7 +698,7 @@ npx tsc --noEmit ✓ (compiles)
 
 - **Uniform wire format**: PlexusStreamItem everywhere, no special cases
 - **No double-wrapping**: Domain → PlexusStreamItem (once)
-- **Multi-hub ready**: Any hub can route, same protocol
+- **Multi-service ready**: Any service can route, same protocol
 - **Clean layering**: Transport (PlexusStreamItem) vs Application (typed events)
 - **Simpler synapse**: No CallEvent unwrap needed
 - **Better codegen**: Clear separation of RPC layer vs typed wrappers
