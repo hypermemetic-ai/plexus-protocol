@@ -228,6 +228,7 @@ data MethodSchema = MethodSchema
   , methodPublic          :: Bool                   -- ^ AUTH-3: callable anonymously (the auth activation's door)
   , methodGroup           :: Maybe Text             -- ^ SYNAPSE-13: the method's group in a listing (OpenAPI's tag)
   , methodExamples        :: [MethodExample]        -- ^ SYNAPSE-13: worked calls, each its params and a note
+  , methodInput           :: Maybe Value            -- ^ SYNAPSE-CC-8 / BIDIR-6: the JSON Schema of what the client sends into a call after it starts (@input@); absent on every server until BIDIR-6
   }
   deriving stock (Show, Eq, Generic)
 
@@ -254,6 +255,7 @@ instance FromJSON MethodSchema where
     -- SYNAPSE-13: absent on an older hub; an unreadable one is ignored
     <*> (o .:? "group" <|> pure Nothing)
     <*> (o .:? "examples" .!= [] <|> pure [])
+    <*> o .:? "input"
 
 instance ToJSON MethodSchema where
   toJSON MethodSchema{..} = object $
@@ -277,6 +279,7 @@ instance ToJSON MethodSchema where
     , if methodPublic then Just ("public" .= True) else Nothing
     , ("group"            .=) <$> methodGroup
     , if null methodExamples then Nothing else Just ("examples" .= methodExamples)
+    , ("input"            .=) <$> methodInput
     ]
 
 -- | SYNAPSE-13: one worked call of a method — the params it sends and a
