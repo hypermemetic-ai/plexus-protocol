@@ -4,8 +4,10 @@ version:            0.5.5.0
 synopsis:           Plexus RPC protocol types and client
 license:            MIT
 license-file:       LICENSE
-author:
-maintainer:
+author:             hypermemetic
+maintainer:         hypermemetic@proton.me
+copyright:          (c) 2025-2026 hypermemetic
+category:           Network
 build-type:         Simple
 tested-with:        GHC == 9.8.4, GHC == 9.12.4
 
