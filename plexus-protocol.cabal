@@ -2,6 +2,10 @@ cabal-version:      3.0
 name:               plexus-protocol
 version:            0.5.5.0
 synopsis:           Plexus RPC protocol types and client
+description:        Haskell types and a client for Plexus RPC, a streaming JSON-RPC 2.0
+                    protocol: stream items and provenance, recursive plugin and method
+                    schemas, authentication, and a WebSocket transport. Shared by Synapse
+                    and other Plexus RPC clients.
 license:            MIT
 license-file:       LICENSE
 author:             hypermemetic
