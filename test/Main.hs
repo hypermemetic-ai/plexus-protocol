@@ -32,6 +32,7 @@ import System.Directory (doesDirectoryExist, listDirectory)
 import System.FilePath (takeExtension, (</>))
 import Test.Hspec
 
+import Plexus.Auth (Refusal (..), View (..))
 import Plexus.RemoteError
 import Plexus.Schema.Recursive
 import Plexus.Types hiding (GuidanceErrorType (..))
@@ -153,6 +154,7 @@ spec = do
   remoteErrorSpec
   rejectionSpec
   strictnessSpec
+  mergedSpec
 
 schemaSpec :: Spec
 schemaSpec = describe "expected/schema.json" $ do
@@ -479,3 +481,77 @@ strictnessSpec = describe "0.7 shapes are required, not defaulted" $ do
 
 isLeft :: Either a b -> Bool
 isLeft = either (const True) (const False)
+
+-- | RETURNS-36: what main brought beside 0.7 — AUTH-2's refusal on a typed
+-- error frame, AUTH-3/4's schema fields, SYNAPSE-13's and SYNAPSE-CC-8's.
+mergedSpec :: Spec
+mergedSpec = describe "0.7 merged with main's auth (RETURNS-36)" $ do
+  let meta = "metadata" .= object
+        ["provenance" .= [s "tickets"], "plexus_hash" .= s "h", "timestamp" .= (0 :: Int)]
+      grantWire = object
+        [ "kind" .= s "forbidden", "reason" .= s "missing_grant", "grant" .= s "tickets.set_status"
+        , "scope" .= s "IDENTITY", "roles" .= [s "editor", s "admin"], "held_on" .= [s "DOCS"] ]
+      grantErr = Forbidden (MissingGrant "tickets.set_status" "IDENTITY" ["editor", "admin"] ["DOCS"])
+      refusal = Refusal
+        { refusalGrant = Just "tickets.set_status", refusalScope = Just "IDENTITY"
+        , refusalRoles = ["editor", "admin"], refusalHeldOn = ["DOCS"], refusalCeiling = []
+        , refusalMessage = "needs tickets.set_status on IDENTITY" }
+
+  it "a missing grant is a forbidden RemoteError, and round-trips" $ do
+    decodes grantWire `shouldBe` Right grantErr
+    toJSON grantErr `shouldBe` grantWire
+    renderRemoteError grantErr `shouldBe` "forbidden: needs tickets.set_status on IDENTITY"
+    renderRemoteError (Forbidden (MissingGrant "auth.role_set" "*" [] []))
+      `shouldBe` "forbidden: needs auth.role_set"
+
+  it "an error frame whose typed error is a missing grant names its refusal" $ do
+    item <- roundTrips @PlexusStreamItem id
+      (object ["type" .= s "error", meta, "recoverable" .= False, "error" .= grantWire])
+    itemError item `shouldBe` grantErr
+    itemErrorRefusal item `shouldBe` Nothing
+    itemRefusal item `shouldBe` Just refusal
+
+  it "AUTH-2's refusal fields beside the typed error are kept and re-encoded" $ do
+    let wire = object
+          [ "type" .= s "error", meta, "recoverable" .= False, "error" .= grantWire
+          , "error_kind" .= s "forbidden", "grant" .= s "tickets.set_status", "scope" .= s "IDENTITY"
+          , "roles" .= [s "editor", s "admin"], "held_on" .= [s "DOCS"] ]
+    item <- roundTrips @PlexusStreamItem id wire
+    itemErrorRefusal item `shouldBe` Just refusal
+    itemRefusal item `shouldBe` Just refusal
+
+  it "any other typed error has no refusal" $ do
+    item <- either fail pure $ decodes @PlexusStreamItem
+      (object ["type" .= s "error", meta, "recoverable" .= False, "error" .= object ["kind" .= s "unauthenticated"]])
+    itemRefusal item `shouldBe` Nothing
+
+  it "a method keeps main's auth, group, examples and input beside 0.7's contract" $ do
+    let wire = object
+          [ "name" .= s "set_status", "description" .= s "d", "hash" .= s "h"
+          , "returns" .= object [], "error" .= object ["title" .= s "SetStatusError"]
+          , "cardinality" .= s "one", "bidirectional" .= False, "http_method" .= s "POST"
+          , "role" .= object ["kind" .= s "rpc"]
+          , "long_description" .= s "long", "grant" .= s "tickets.set_status", "target" .= s "id"
+          , "held_on" .= [s "*"], "public" .= True, "group" .= s "write"
+          , "examples" .= [object ["params" .= object ["id" .= s "A-1"], "note" .= s "one"]]
+          , "input" .= object ["type" .= s "string"] ]
+    m <- roundTrips @MethodSchema id wire
+    methodGrant m `shouldBe` Just "tickets.set_status"
+    methodGroup m `shouldBe` Just "write"
+    methodCardinality m `shouldBe` CardinalityOne
+
+  it "a plugin keeps main's roles and view beside 0.7's self_hash and CONTEXT-5's request" $ do
+    let wire = object
+          [ "namespace" .= s "tickets", "version" .= s "1", "description" .= s "d", "hash" .= s "h"
+          , "self_hash" .= s "sh", "methods" .= ([] :: [Value])
+          , "request" .= object ["type" .= s "object"]
+          , "roles" .= object ["viewer" .= [s "tickets.get"]], "view" .= s "caller" ]
+    p <- roundTrips @PluginSchema id wire
+    psView p `shouldBe` Just Caller
+    psSelfHash p `shouldBe` Just "sh"
+
+  it "an anonymous view's plugin may omit its hash, version and description (AUTH-4)" $ do
+    p <- either fail pure $ decodes @PluginSchema
+      (object ["namespace" .= s "menger", "methods" .= ([] :: [Value]), "view" .= s "anonymous"])
+    psHash p `shouldBe` ""
+    psView p `shouldBe` Just Anonymous
