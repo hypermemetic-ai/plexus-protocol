@@ -344,6 +344,18 @@ wireLiterals =
     , object ["kind" .= s "handle_not_supported", "activation" .= s "tickets"] )
   , ( Execution "database is locked"
     , object ["kind" .= s "execution", "message" .= s "database is locked"] )
+    -- main's refusals in the vocabulary (RETURNS-36; plexus-client's remote_error.rs)
+  , ( Forbidden (MissingGrant "tickets.create" "*" ["editor", "admin"] [])
+    , object [ "kind" .= s "forbidden", "reason" .= s "missing_grant", "grant" .= s "tickets.create", "scope" .= s "*"
+             , "roles" .= [s "editor", s "admin"], "held_on" .= ([] :: [Text]) ] )
+  , ( TooManyCalls 8 Nothing
+    , object ["kind" .= s "too_many_calls", "max" .= (8 :: Int)] )
+  , ( TooManyCalls 4 (Just "echo")
+    , object ["kind" .= s "too_many_calls", "max" .= (4 :: Int), "child" .= s "echo"] )
+  , ( ChildUnavailable "echo" "the connection has closed"
+    , object ["kind" .= s "child_unavailable", "child" .= s "echo", "reason" .= s "the connection has closed"] )
+  , ( ChildTimeout "echo" 5000
+    , object ["kind" .= s "child_timeout", "child" .= s "echo", "timeout_ms" .= (5000 :: Int)] )
   ]
 
 s :: Text -> Text
@@ -394,6 +406,11 @@ remoteErrorSpec = describe "RemoteError (RETURNS-4 wire literals)" $ do
       , "forbidden: call not accepted"
       , "handle resolution not supported by activation: tickets"
       , "execution failed: database is locked"
+      , "forbidden: needs `tickets.create`"
+      , "too many calls open (at most 8): close one, or call again later"
+      , "too many calls open on child echo (at most 4): close one, or call again later"
+      , "child echo is unavailable: the connection has closed"
+      , "child echo did not open the call in 5000 ms"
       ]
 
   it "folds line breaks in server text so the line stays one line" $
@@ -435,6 +452,7 @@ strictnessSpec = describe "0.7 shapes are required, not defaulted" $ do
   let method extra = object $
         [ "name" .= s "get", "description" .= s "d", "hash" .= s "h" ] <> extra
       returns = "returns" .= object []
+      returns' = "returns" .= object ["type" .= s "string"]
 
   it "Cardinality is \"one\" or \"many\"" $ do
     toJSON CardinalityOne `shouldBe` String "one"
@@ -443,9 +461,8 @@ strictnessSpec = describe "0.7 shapes are required, not defaulted" $ do
     decodes (String "many") `shouldBe` Right CardinalityMany
     decodes @Cardinality (String "some") `shouldSatisfy` isLeft
 
-  it "a method without cardinality does not parse (a 0.6 streaming flag is not read)" $ do
+  it "a method with neither cardinality nor streaming does not parse" $
     decodes @MethodSchema (method [returns]) `shouldSatisfy` isLeft
-    decodes @MethodSchema (method [returns, "streaming" .= True]) `shouldSatisfy` isLeft
 
   it "a method without returns does not parse" $
     decodes @MethodSchema (method ["cardinality" .= s "one"]) `shouldSatisfy` isLeft
@@ -464,15 +481,61 @@ strictnessSpec = describe "0.7 shapes are required, not defaulted" $ do
   let meta = "metadata" .= object
         ["provenance" .= [s "tickets"], "plexus_hash" .= s "h", "timestamp" .= (0 :: Int)]
 
-  it "a 0.6 progress frame (message, percentage) does not parse" $
-    decodes @PlexusStreamItem
-      (object ["type" .= s "progress", meta, "message" .= s "half", "percentage" .= (50 :: Int)])
-      `shouldSatisfy` isLeft
+  -- RETURNS-36 (the coordinator's decision): synapse 4.0 reads the
+  -- published 0.7.0 line too, as plexus-core's child seam does
+  -- (remote_child/peer.rs) — from what the peer itself declared, never
+  -- guessing; a 0.8 schema is read strictly, as above.
+  it "a 0.7.0 method: its cardinality is its streaming flag, its missing returns {}" $ do
+    many <- either fail pure $ decodes @MethodSchema (method ["streaming" .= True])
+    methodCardinality many `shouldBe` CardinalityMany
+    methodReturns many `shouldBe` object []
+    one <- either fail pure $ decodes @MethodSchema (method [returns', "streaming" .= False])
+    methodCardinality one `shouldBe` CardinalityOne
+    methodReturns one `shouldBe` object ["type" .= s "string"]
+    -- written back in 0.8's shape
+    toJSON many `shouldBe` method
+      [ returns, "cardinality" .= s "many", "bidirectional" .= False
+      , "http_method" .= s "POST", "role" .= object ["kind" .= s "rpc"] ]
 
-  it "a 0.6 error frame (message, code) does not parse" $
-    decodes @PlexusStreamItem
-      (object ["type" .= s "error", meta, "message" .= s "boom", "code" .= s "-32000", "recoverable" .= False])
-      `shouldSatisfy` isLeft
+  it "a 0.8 method's cardinality wins over a streaming flag beside it" $ do
+    m <- either fail pure $ decodes @MethodSchema (method [returns, "cardinality" .= s "one", "streaming" .= True])
+    methodCardinality m `shouldBe` CardinalityOne
+
+  it "a 0.7.0 progress frame (message, percentage) reads as the default progress type, Note" $ do
+    item <- either fail pure $ decodes @PlexusStreamItem
+      (object ["type" .= s "progress", meta, "message" .= s "half", "percentage" .= (50 :: Int)])
+    case item of
+      StreamProgress _ _ _ c -> c `shouldBe` object ["message" .= s "half", "percentage" .= (50 :: Int)]
+      other -> expectationFailure (show other)
+
+  it "a 0.7.0 error frame (message, code) reads typed from its fields, and keeps them" $ do
+    let wire = object ["type" .= s "error", meta, "message" .= s "boom", "code" .= s "-32000", "recoverable" .= False]
+    item <- either fail pure $ decodes @PlexusStreamItem wire
+    itemError item `shouldBe` Execution "boom"
+    toJSON item `shouldBe` object
+      [ "type" .= s "error", meta, "message" .= s "boom", "code" .= s "-32000", "recoverable" .= False
+      , "error" .= object ["kind" .= s "execution", "message" .= s "boom"] ]
+
+  it "a 0.7.0 error frame: error_kind first, else code, as peer.rs reads it" $ do
+    let frame extra = object (["type" .= s "error", meta, "recoverable" .= False] <> extra)
+        typed extra = either error itemError (decodes @PlexusStreamItem (frame extra))
+    typed [ "message" .= s "needs tickets.set_status on IDENTITY", "code" .= s "-32003", "error_kind" .= s "forbidden"
+          , "grant" .= s "tickets.set_status", "scope" .= s "IDENTITY"
+          , "roles" .= [s "editor", s "admin"], "held_on" .= [s "DOCS"] ]
+      `shouldBe` Forbidden (MissingGrant "tickets.set_status" "IDENTITY" ["editor", "admin"] ["DOCS"])
+    typed ["message" .= s "x", "code" .= s "-32003"] `shouldBe` Forbidden (MissingGrant "" "" [] [])
+    typed ["message" .= s "x", "error_kind" .= s "forbidden", "reason" .= s "missing_scope", "scope" .= s "t:w"]
+      `shouldBe` Forbidden (MissingScope "t:w")
+    typed ["message" .= s "bad", "code" .= s "-32602"] `shouldBe` InvalidParams Nothing (Malformed "bad")
+    typed ["message" .= s "bad", "error_kind" .= s "invalid_params"] `shouldBe` InvalidParams Nothing (Malformed "bad")
+    typed ["message" .= s "sign in", "code" .= (-32001 :: Int)] `shouldBe` Unauthenticated
+    typed ["message" .= s "busy", "error_kind" .= s "too_many_calls", "max" .= (8 :: Int)] `shouldBe` TooManyCalls 8 Nothing
+    typed ["error_kind" .= s "child_unavailable", "child" .= s "echo", "reason" .= s "closed"] `shouldBe` ChildUnavailable "echo" "closed"
+    typed ["error_kind" .= s "child_timeout", "child" .= s "echo", "timeout_ms" .= (5000 :: Int)] `shouldBe` ChildTimeout "echo" 5000
+    typed ["message" .= s "Method not found: a.b", "code" .= s "-32601"] `shouldBe` Execution "Method not found: a.b"
+    itemRefusal (either error id (decodes @PlexusStreamItem (frame
+      [ "message" .= s "needs x", "error_kind" .= s "forbidden", "grant" .= s "tickets.get", "scope" .= s "*" ])))
+      `shouldSatisfy` maybe False ((== Just "tickets.get") . refusalGrant)
 
   it "an error frame must say whether it is recoverable" $
     decodes @PlexusStreamItem
@@ -500,9 +563,10 @@ mergedSpec = describe "0.7 merged with main's auth (RETURNS-36)" $ do
   it "a missing grant is a forbidden RemoteError, and round-trips" $ do
     decodes grantWire `shouldBe` Right grantErr
     toJSON grantErr `shouldBe` grantWire
-    renderRemoteError grantErr `shouldBe` "forbidden: needs tickets.set_status on IDENTITY"
+    -- the Rust Display's line (plexus-client's remote_error.rs)
+    renderRemoteError grantErr `shouldBe` "forbidden: needs `tickets.set_status` on `IDENTITY`"
     renderRemoteError (Forbidden (MissingGrant "auth.role_set" "*" [] []))
-      `shouldBe` "forbidden: needs auth.role_set"
+      `shouldBe` "forbidden: needs `auth.role_set`"
 
   it "an error frame whose typed error is a missing grant names its refusal" $ do
     item <- roundTrips @PlexusStreamItem id
