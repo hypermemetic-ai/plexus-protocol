@@ -550,6 +550,7 @@ substrateRpcSub conn onSubscribed method params = do
             Nothing     -> Execution $ T.pack $ "Subscription error: " <> show err
         , itemRecoverable = False
         , itemErrorRefusal = Nothing
+        , itemErrorBeside = KM.empty
         }
 
     Right (RpcSuccess _ result) -> do

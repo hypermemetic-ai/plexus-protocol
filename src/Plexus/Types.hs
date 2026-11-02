@@ -538,6 +538,11 @@ data PlexusStreamItem
         -- @grant@, @scope@, @roles@, @held_on@) when the service sends them
         -- beside the typed error; Nothing otherwise. 'itemRefusal' also
         -- reads a refusal out of a typed @Forbidden (MissingGrant …)@.
+      , itemErrorBeside :: KM.KeyMap Value
+        -- ^ RETURNS-36: every other key the frame carried beside the typed
+        -- error (a merged service's @message@, @code@, @error_kind@ and
+        -- the refusal's fields), kept as sent and written back so; empty
+        -- for a frame built here.
       }
   | StreamRequest
       { itemPlexusHash  :: Text
@@ -556,8 +561,8 @@ data PlexusStreamItem
 -- Matches every error (a refusal too); builds one with no refusal fields.
 -- 'StreamErrorWith' carries AUTH-2's refusal fields when a service sends them.
 pattern StreamError :: Text -> Provenance -> RemoteError -> Bool -> PlexusStreamItem
-pattern StreamError hash prov err rec <- StreamErrorWith hash prov err rec _
-  where StreamError hash prov err rec = StreamErrorWith hash prov err rec Nothing
+pattern StreamError hash prov err rec <- StreamErrorWith hash prov err rec _ _
+  where StreamError hash prov err rec = StreamErrorWith hash prov err rec Nothing KM.empty
 
 {-# COMPLETE StreamProgress, StreamData, StreamGuidance, StreamError, StreamRequest, StreamDone #-}
 
@@ -567,8 +572,8 @@ pattern StreamError hash prov err rec <- StreamErrorWith hash prov err rec _
 -- one (an in-band error event naming the same fields).
 itemRefusal :: PlexusStreamItem -> Maybe Refusal
 itemRefusal = \case
-  StreamErrorWith _ _ _ _ (Just r) -> Just r
-  StreamErrorWith _ _ err _ Nothing -> refusalOfRemote err
+  StreamErrorWith _ _ _ _ (Just r) _ -> Just r
+  StreamErrorWith _ _ err _ Nothing _ -> refusalOfRemote err
   StreamData _ _ _ (Object o) -> refusalFromObject o
   _ -> Nothing
 
@@ -603,6 +608,7 @@ instance FromJSON PlexusStreamItem where
             <$> o .: "error"
             <*> o .: "recoverable"
             <*> pure (refusalFromObject o)
+            <*> pure (besideError o)
           "request" -> StreamRequest hash prov
             <$> o .: "request_id"
             <*> o .: "request"
@@ -636,6 +642,7 @@ instance FromJSON PlexusStreamItem where
             <*> o .: "error"
             <*> o .:? "recoverable" .!= False
             <*> pure (refusalFromObject o)
+            <*> pure (besideError o)
           "request" -> StreamRequest hash
             <$> o .: "provenance"
             <*> o .: "request_id"
@@ -667,14 +674,14 @@ instance ToJSON PlexusStreamItem where
     [ ("available_methods" .=) <$> availMethods
     , ("method_schema" .=) <$> methodSchema
     ]
-  toJSON (StreamErrorWith hash prov err rec refusal) = object $
+  toJSON (StreamErrorWith hash prov err rec refusal beside) = object $
     [ "type" .= ("error" :: Text)
     , "metadata" .= StreamMetadata prov hash 0
     , "recoverable" .= rec
     , "error" .= err
-    ] <> refusalFields
+    ] <> if KM.null beside then refusalFields else KM.toList beside
     where
-      -- the refusal's own fields, beside the typed error (as the service sent them)
+      -- a frame built here with a refusal: its own fields, beside the typed error
       refusalFields = case toJSON <$> refusal of
         Just (Object ro) -> [ (k, v) | (k, v) <- KM.toList ro, k /= "message" ]
         _ -> []
@@ -690,6 +697,10 @@ instance ToJSON PlexusStreamItem where
     [ "type" .= ("done" :: Text)
     , "metadata" .= StreamMetadata prov hash 0
     ]
+
+-- | An error frame's keys beside the envelope and the typed error.
+besideError :: Object -> KM.KeyMap Value
+besideError = KM.filterWithKey (\k _ -> k `notElem` ["type", "metadata", "provenance", "plexus_hash", "recoverable", "error"])
 
 -- | The AUTH-2 refusal a typed @Forbidden (MissingGrant …)@ names.
 refusalOfRemote :: RemoteError -> Maybe Refusal

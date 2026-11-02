@@ -520,6 +520,14 @@ mergedSpec = describe "0.7 merged with main's auth (RETURNS-36)" $ do
     itemErrorRefusal item `shouldBe` Just refusal
     itemRefusal item `shouldBe` Just refusal
 
+  it "main's message, code and error_kind beside the typed error are kept as sent" $ do
+    item <- roundTrips @PlexusStreamItem id $ object
+      [ "type" .= s "error", meta, "recoverable" .= False
+      , "error" .= object ["kind" .= s "invalid_params", "param" .= s "id", "problem" .= s "missing"]
+      , "message" .= s "Invalid params: missing field: id", "code" .= s "-32602", "error_kind" .= s "invalid_params" ]
+    itemError item `shouldBe` InvalidParams (Just "id") Missing
+    itemRefusal item `shouldBe` Nothing
+
   it "any other typed error has no refusal" $ do
     item <- either fail pure $ decodes @PlexusStreamItem
       (object ["type" .= s "error", meta, "recoverable" .= False, "error" .= object ["kind" .= s "unauthenticated"]])
