@@ -594,8 +594,8 @@ instance FromJSON PlexusStreamItem where
             prov = metaProvenance meta
         case typ of
           "progress" -> StreamProgress hash prov
-            <$> o .: "content_type"
-            <*> o .: "content"
+            <$> o .:? "content_type" .!= ""
+            <*> progressContent o
           "data" -> StreamData hash prov
             <$> o .: "content_type"
             <*> o .: "content"
@@ -605,7 +605,7 @@ instance FromJSON PlexusStreamItem where
             <*> o .:? "available_methods"
             <*> o .:? "method_schema"
           "error" -> StreamErrorWith hash prov
-            <$> o .: "error"
+            <$> typedError o
             <*> o .: "recoverable"
             <*> pure (refusalFromObject o)
             <*> pure (besideError o)
@@ -639,7 +639,7 @@ instance FromJSON PlexusStreamItem where
             <*> o .:? "method_schema"
           "error" -> StreamErrorWith hash
             <$> o .:? "provenance" .!= Provenance []
-            <*> o .: "error"
+            <*> typedError o
             <*> o .:? "recoverable" .!= False
             <*> pure (refusalFromObject o)
             <*> pure (besideError o)
@@ -697,6 +697,24 @@ instance ToJSON PlexusStreamItem where
     [ "type" .= ("done" :: Text)
     , "metadata" .= StreamMetadata prov hash 0
     ]
+
+-- | An error frame's typed error: its @error@ (plexus 0.8), else — a frame
+--   of the published 0.7.0 line — what its spec/05 fields say
+--   ('RE.remoteErrorOfFields'; RETURNS-36).
+typedError :: Object -> Parser RemoteError
+typedError o = case KM.lookup "error" o of
+  Just v -> parseJSON v
+  Nothing -> pure (RE.remoteErrorOfFields o)
+
+-- | A progress frame's content: its @content@ (plexus 0.8), else — a 0.7.0
+--   frame — its @message@ and @percentage@ as the default progress type,
+--   @Note@ (RETURNS-36, as plexus-core's child seam reads it).
+progressContent :: Object -> Parser Value
+progressContent o = case KM.lookup "content" o of
+  Just v -> pure v
+  Nothing -> pure $ Object $ KM.fromList $
+    ("message", maybe (String "") id (KM.lookup "message" o))
+      : [ ("percentage", p) | Just p <- [KM.lookup "percentage" o] ]
 
 -- | An error frame's keys beside the envelope and the typed error.
 besideError :: Object -> KM.KeyMap Value

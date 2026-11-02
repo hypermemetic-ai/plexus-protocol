@@ -271,10 +271,10 @@ instance FromJSON MethodSchema where
     <*> o .:? "description" .!= ""
     <*> o .:? "hash" .!= ""
     <*> o .:? "params"
-    <*> o .: "returns"
+    <*> returnsOf o
     <*> o .:? "error"
     <*> o .:? "progress"
-    <*> o .: "cardinality"
+    <*> cardinalityOf o
     <*> o .:? "bidirectional"  .!= False
     <*> o .:? "http_method"    .!= "POST"
     <*> o .:? "request_type"
@@ -291,6 +291,26 @@ instance FromJSON MethodSchema where
     <*> (o .:? "group" <|> pure Nothing)
     <*> (o .:? "examples" .!= [] <|> pure [])
     <*> o .:? "input"
+
+-- | RETURNS-36: a method's cardinality — its @cardinality@ (plexus 0.8);
+--   else, a method of the published 0.7.0 line, its own @streaming@ flag
+--   (@true@ many, @false@ one), as plexus-core's child seam reads it; a
+--   method that states neither is refused.
+cardinalityOf :: Object -> Parser Cardinality
+cardinalityOf o = case KM.lookup "cardinality" o of
+  Just c -> parseJSON c
+  Nothing -> case KM.lookup "streaming" o of
+    Just (Bool True) -> pure CardinalityMany
+    Just (Bool False) -> pure CardinalityOne
+    _ -> fail "a method states neither cardinality (plexus 0.8) nor streaming (0.7.0)"
+
+-- | RETURNS-36: a method's @returns@ — required of a 0.8 method (one that
+--   states its cardinality); a 0.7.0 method's missing one is the empty
+--   schema, @{}@.
+returnsOf :: Object -> Parser Value
+returnsOf o
+  | KM.member "cardinality" o = o .: "returns"
+  | otherwise = o .:? "returns" .!= Object KM.empty
 
 -- | Encodes as the Rust @MethodSchema@ serializes: an absent optional field
 --   is omitted, not @null@.

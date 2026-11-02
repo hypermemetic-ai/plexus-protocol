@@ -26,6 +26,9 @@
 --  "roles": ["editor", "admin"], "held_on": ["DOCS"]}
 -- {"kind": "handle_not_supported", "activation": "tickets"}
 -- {"kind": "execution", "message": "database is locked"}
+-- {"kind": "too_many_calls", "max": 8}
+-- {"kind": "child_unavailable", "child": "echo", "reason": "the connection has closed"}
+-- {"kind": "child_timeout", "child": "echo", "timeout_ms": 5000}
 -- @
 --
 -- @param@ is omitted when the failure is not about one parameter, and
@@ -45,9 +48,11 @@ module Plexus.RemoteError
   , ParamProblem(..)
   , DenyReason(..)
   , renderRemoteError
+  , remoteErrorOfFields
   ) where
 
 import Data.Aeson
+import qualified Data.Aeson.KeyMap as KM
 import Data.Aeson.Types (Pair, Parser)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -75,6 +80,15 @@ data RemoteError
     -- ^ The method ran and failed for a reason that is not the activation
     -- saying no (that is an @err@ item): a panic, a lost dependency
     -- (@message@).
+  | TooManyCalls Integer (Maybe Text)
+    -- ^ spec/05: too many calls open at once (@max@), on a child when the
+    -- limit is a child's (@child@, omitted otherwise). RETURNS-36.
+  | ChildUnavailable Text Text
+    -- ^ spec/12: the child the call was routed to (@child@) cannot be
+    -- reached (@reason@). RETURNS-36.
+  | ChildTimeout Text Integer
+    -- ^ spec/12: the child (@child@) did not open the call in the service's
+    -- time (@timeout_ms@). RETURNS-36.
   deriving stock (Show, Eq, Ord, Generic)
 
 -- | What is wrong with a call's params. Flattened into 'InvalidParams' under
@@ -124,6 +138,9 @@ instance FromJSON RemoteError where
       "forbidden"            -> Forbidden <$> parseDenyReason o
       "handle_not_supported" -> HandleNotSupported <$> o .: "activation"
       "execution"            -> Execution <$> o .: "message"
+      "too_many_calls"       -> TooManyCalls <$> o .: "max" <*> o .:? "child"
+      "child_unavailable"    -> ChildUnavailable <$> o .: "child" <*> o .: "reason"
+      "child_timeout"        -> ChildTimeout <$> o .: "child" <*> o .: "timeout_ms"
       other -> fail $ "unknown RemoteError kind: " <> T.unpack other
 
 -- | Standalone, a 'ParamProblem' is its flattened fields:
@@ -163,6 +180,12 @@ remoteErrorPairs = \case
     [kindPair "handle_not_supported", "activation" .= a]
   Execution msg ->
     [kindPair "execution", "message" .= msg]
+  TooManyCalls mx child ->
+    kindPair "too_many_calls" : "max" .= mx : maybe [] (\c -> ["child" .= c]) child
+  ChildUnavailable child reason ->
+    [kindPair "child_unavailable", "child" .= child, "reason" .= reason]
+  ChildTimeout child ms ->
+    [kindPair "child_timeout", "child" .= child, "timeout_ms" .= ms]
 
 paramProblemPairs :: ParamProblem -> [Pair]
 paramProblemPairs = \case
@@ -221,12 +244,56 @@ renderRemoteError = \case
     MissingScope s -> "missing required scope `" <> oneLine s <> "`"
     TenantBoundary -> "tenant boundary"
     NotAccepted    -> "call not accepted"
-    MissingGrant g "*" _ _ -> "needs " <> oneLine g
-    MissingGrant g sc _ _  -> "needs " <> oneLine g <> " on " <> oneLine sc
+    MissingGrant g "*" _ _ -> "needs `" <> oneLine g <> "`"
+    MissingGrant g sc _ _  -> "needs `" <> oneLine g <> "` on `" <> oneLine sc <> "`"
   HandleNotSupported a ->
     "handle resolution not supported by activation: " <> oneLine a
   Execution msg ->
     "execution failed: " <> oneLine msg
+  TooManyCalls mx child ->
+    "too many calls open" <> maybe "" (\c -> " on child " <> oneLine c) child
+      <> " (at most " <> T.pack (show mx) <> "): close one, or call again later"
+  ChildUnavailable child reason ->
+    "child " <> oneLine child <> " is unavailable: " <> oneLine reason
+  ChildTimeout child ms ->
+    "child " <> oneLine child <> " did not open the call in " <> T.pack (show ms) <> " ms"
 
 oneLine :: Text -> Text
 oneLine = T.map (\c -> if c == '\n' || c == '\r' then ' ' else c)
+
+-- ============================================================================
+-- A 0.7.0 frame's fields
+-- ============================================================================
+
+-- | RETURNS-36: the 'RemoteError' a frame of the published 0.7.0 line says
+-- with spec/05's fields alone (no typed @error@): by @error_kind@ when there
+-- is one, else by @code@; what neither names is the method failing
+-- (@execution@, its @message@). The same reading as plexus-core's child
+-- seam (@remote_child/peer.rs@, @remote_error_of@).
+remoteErrorOfFields :: Object -> RemoteError
+remoteErrorOfFields o = case maybe code id (str "error_kind") of
+  k | k `elem` ["invalid_params", "-32602"] -> InvalidParams Nothing (Malformed message)
+    | k `elem` ["unauthenticated", "-32001"] -> Unauthenticated
+    | k `elem` ["forbidden", "-32003"] -> Forbidden $ case str "reason" of
+        Just "missing_scope" -> MissingScope (txt "scope")
+        Just "tenant_boundary" -> TenantBoundary
+        Just "not_accepted" -> NotAccepted
+        _ -> MissingGrant (txt "grant") (txt "scope") (strings "roles") (strings "held_on")
+  "too_many_calls" -> TooManyCalls (int "max") (str "child")
+  "child_unavailable" -> ChildUnavailable (txt "child") (txt "reason")
+  "child_timeout" -> ChildTimeout (txt "child") (int "timeout_ms")
+  _ -> Execution message
+  where
+    str k = case KM.lookup k o of { Just (String t) -> Just t; _ -> Nothing }
+    txt k = maybe "" id (str k)
+    message = txt "message"
+    code = case KM.lookup "code" o of
+      Just (String c) -> c
+      Just n@(Number _) | Success i <- fromJSON n -> T.pack (show (i :: Integer))
+      _ -> ""
+    int k = case KM.lookup k o of
+      Just n@(Number _) | Success i <- fromJSON n -> i
+      _ -> 0
+    strings k = case KM.lookup k o of
+      Just (Array a) -> [ t | String t <- foldr (:) [] a ]
+      _ -> []
