@@ -36,7 +36,6 @@ module Plexus.Types
   , getPlexusHash
   ) where
 
-import Control.Applicative ((<|>))
 import Data.Aeson
 import qualified Data.Aeson.KeyMap as KM
 import Data.Aeson.Types (Parser)
@@ -48,6 +47,10 @@ import qualified Data.Text.Encoding as T
 import GHC.Generics (Generic)
 
 import Plexus.Auth (Refusal(..), refusalFromObject)
+-- Only the types: RemoteError's constructors share names with
+-- 'GuidanceErrorType''s.
+import qualified Plexus.RemoteError as RE
+import Plexus.RemoteError (RemoteError)
 
 -- | Request ID for JSON-RPC calls
 newtype RequestId = RequestId { unRequestId :: Int }
@@ -105,10 +108,26 @@ instance FromJSON RpcResponse where
       _ -> fail "Expected either 'result' or 'error' field"
 
 -- | JSON-RPC error object
+--
+-- A Plexus rejection (plexus 0.7) keeps JSON-RPC's @code@ and @message@
+-- (the 'RemoteError''s one-line rendering) and carries the typed
+-- 'RemoteError' in @data@:
+--
+-- @
+-- {"code": -32601, "message": "method not found: tickets.frob",
+--  "data": {"kind": "method_not_found", "activation": "tickets", "method": "frob"}}
+-- @
+--
+-- 'errData' is 'Nothing' for a rejection that is not a Plexus call failure
+-- and so carries no 'RemoteError': no @data@ (jsonrpsee's own
+-- @"Method not found"@, a service's @{ns}.schema@ / @{ns}.respond@ refusals), or
+-- a @data@ that is not a @kind@-tagged object (jsonrpsee's param-parse
+-- rejection carries a string). A @kind@-tagged @data@ is decoded strictly: a
+-- kind this library does not know is a decode error, as for an error frame.
 data RpcError = RpcErrorObj
   { errCode    :: Int
   , errMessage :: Text
-  , errData    :: Maybe Value
+  , errData    :: Maybe RemoteError
   }
   deriving stock (Show, Eq, Generic)
 
@@ -116,7 +135,17 @@ instance FromJSON RpcError where
   parseJSON = withObject "RpcError" $ \o -> RpcErrorObj
     <$> o .: "code"
     <*> o .: "message"
-    <*> o .:? "data"
+    <*> (o .:? "data" >>= traverse parseJSON . (>>= remoteErrorShaped))
+    where
+      remoteErrorShaped :: Value -> Maybe Value
+      remoteErrorShaped v@(Object d) | KM.member "kind" d = Just v
+      remoteErrorShaped _ = Nothing
+
+instance ToJSON RpcError where
+  toJSON RpcErrorObj{..} = object $
+    [ "code"    .= errCode
+    , "message" .= errMessage
+    ] <> catMaybes [("data" .=) <$> errData]
 
 -- | Subscription notification from server
 -- This is what we receive for each stream item
@@ -465,12 +494,25 @@ instance (ToJSON t) => ToJSON (Response t) where
 --
 -- New format uses metadata wrapper:
 -- @{"type":"data","metadata":{...},"content_type":"...","content":{...}}@
+--
+-- plexus 0.7 frames:
+--
+-- @
+-- {"type":"progress","metadata":{...},"content_type":"ns.method","content":<P>}
+-- {"type":"error","metadata":{...},"recoverable":false,"error":<RemoteError>}
+-- @
+--
+-- A progress frame carries the method's declared progress type @P@ (the
+-- schema's 'Plexus.Schema.Recursive.methodProgress'; for the default @Note@,
+-- @{"message": …, "percentage": …}@). An error frame means the call itself
+-- failed; an activation saying no is a 'StreamData' item whose content is
+-- @{"err": …}@.
 data PlexusStreamItem
   = StreamProgress
       { itemPlexusHash  :: Text
       , itemProvenance  :: Provenance
-      , itemMessage     :: Text
-      , itemPercentage  :: Maybe Double
+      , itemContentType :: Text   -- ^ The call's method, as on its data items (e.g. @"tickets.import"@)
+      , itemContent     :: Value  -- ^ The method's progress value @P@
       }
   | StreamData
       { itemPlexusHash  :: Text
@@ -489,11 +531,13 @@ data PlexusStreamItem
   | StreamErrorWith
       { itemPlexusHash  :: Text
       , itemProvenance  :: Provenance
-      , itemError       :: Text
-      , itemRecoverable :: Bool
+      , itemError       :: RemoteError  -- ^ Why the call failed, typed
+      , itemRecoverable :: Bool         -- ^ Whether the operation can be retried
       , itemErrorRefusal :: Maybe Refusal
-        -- ^ AUTH-2: @error_kind: "forbidden"@ and what it names; Nothing
-        -- for every other error (and on every service without a gate)
+        -- ^ AUTH-2: the refusal's own fields (@error_kind: "forbidden"@,
+        -- @grant@, @scope@, @roles@, @held_on@) when the service sends them
+        -- beside the typed error; Nothing otherwise. 'itemRefusal' also
+        -- reads a refusal out of a typed @Forbidden (MissingGrant …)@.
       }
   | StreamRequest
       { itemPlexusHash  :: Text
@@ -508,21 +552,23 @@ data PlexusStreamItem
       }
   deriving stock (Show, Eq, Generic)
 
--- | An error item as it was before AUTH-2: hash, provenance, message,
--- recoverable. Matches every error (a refusal too); builds one with no
--- refusal. 'StreamErrorWith' carries the typed refusal.
-pattern StreamError :: Text -> Provenance -> Text -> Bool -> PlexusStreamItem
+-- | An error item: hash, provenance, the typed 'RemoteError', recoverable.
+-- Matches every error (a refusal too); builds one with no refusal fields.
+-- 'StreamErrorWith' carries AUTH-2's refusal fields when a service sends them.
+pattern StreamError :: Text -> Provenance -> RemoteError -> Bool -> PlexusStreamItem
 pattern StreamError hash prov err rec <- StreamErrorWith hash prov err rec _
   where StreamError hash prov err rec = StreamErrorWith hash prov err rec Nothing
 
 {-# COMPLETE StreamProgress, StreamData, StreamGuidance, StreamError, StreamRequest, StreamDone #-}
 
 -- | AUTH-2: the refusal an item carries — an error item with
--- @error_kind: "forbidden"@, or a data item whose content is one (an
--- in-band error event naming the same fields).
+-- @error_kind: "forbidden"@ (or whose typed error is a
+-- @Forbidden (MissingGrant …)@, plexus 0.8), or a data item whose content is
+-- one (an in-band error event naming the same fields).
 itemRefusal :: PlexusStreamItem -> Maybe Refusal
 itemRefusal = \case
-  StreamErrorWith _ _ _ _ r -> r
+  StreamErrorWith _ _ _ _ (Just r) -> Just r
+  StreamErrorWith _ _ err _ Nothing -> refusalOfRemote err
   StreamData _ _ _ (Object o) -> refusalFromObject o
   _ -> Nothing
 
@@ -543,8 +589,8 @@ instance FromJSON PlexusStreamItem where
             prov = metaProvenance meta
         case typ of
           "progress" -> StreamProgress hash prov
-            <$> o .: "message"
-            <*> o .:? "percentage"
+            <$> o .: "content_type"
+            <*> o .: "content"
           "data" -> StreamData hash prov
             <$> o .: "content_type"
             <*> o .: "content"
@@ -554,8 +600,8 @@ instance FromJSON PlexusStreamItem where
             <*> o .:? "available_methods"
             <*> o .:? "method_schema"
           "error" -> StreamErrorWith hash prov
-            <$> o .: "message"
-            <*> o .:? "recoverable" .!= False
+            <$> o .: "error"
+            <*> o .: "recoverable"
             <*> pure (refusalFromObject o)
           "request" -> StreamRequest hash prov
             <$> o .: "request_id"
@@ -573,8 +619,8 @@ instance FromJSON PlexusStreamItem where
         case typ of
           "progress" -> StreamProgress hash
             <$> o .: "provenance"
-            <*> o .: "message"
-            <*> o .:? "percentage"
+            <*> o .: "content_type"
+            <*> o .: "content"
           "data" -> StreamData hash
             <$> o .: "provenance"
             <*> o .: "content_type"
@@ -587,7 +633,7 @@ instance FromJSON PlexusStreamItem where
             <*> o .:? "method_schema"
           "error" -> StreamErrorWith hash
             <$> o .:? "provenance" .!= Provenance []
-            <*> (o .: "error" <|> o .: "message")
+            <*> o .: "error"
             <*> o .:? "recoverable" .!= False
             <*> pure (refusalFromObject o)
           "request" -> StreamRequest hash
@@ -600,11 +646,11 @@ instance FromJSON PlexusStreamItem where
           _ -> fail $ "Unknown event type: " <> T.unpack typ
 
 instance ToJSON PlexusStreamItem where
-  toJSON (StreamProgress hash prov msg pct) = object
+  toJSON (StreamProgress hash prov ct content) = object
     [ "type" .= ("progress" :: Text)
     , "metadata" .= StreamMetadata prov hash 0
-    , "message" .= msg
-    , "percentage" .= pct
+    , "content_type" .= ct
+    , "content" .= content
     ]
   toJSON (StreamData hash prov ct dat) = object
     [ "type" .= ("data" :: Text)
@@ -624,11 +670,11 @@ instance ToJSON PlexusStreamItem where
   toJSON (StreamErrorWith hash prov err rec refusal) = object $
     [ "type" .= ("error" :: Text)
     , "metadata" .= StreamMetadata prov hash 0
-    , "message" .= err
     , "recoverable" .= rec
+    , "error" .= err
     ] <> refusalFields
     where
-      -- the refusal's own fields, beside the message (as the service sent them)
+      -- the refusal's own fields, beside the typed error (as the service sent them)
       refusalFields = case toJSON <$> refusal of
         Just (Object ro) -> [ (k, v) | (k, v) <- KM.toList ro, k /= "message" ]
         _ -> []
@@ -644,6 +690,19 @@ instance ToJSON PlexusStreamItem where
     [ "type" .= ("done" :: Text)
     , "metadata" .= StreamMetadata prov hash 0
     ]
+
+-- | The AUTH-2 refusal a typed @Forbidden (MissingGrant …)@ names.
+refusalOfRemote :: RemoteError -> Maybe Refusal
+refusalOfRemote = \case
+  RE.Forbidden (RE.MissingGrant g sc roles held) -> Just Refusal
+    { refusalGrant = Just g
+    , refusalScope = Just sc
+    , refusalRoles = roles
+    , refusalHeldOn = held
+    , refusalCeiling = []
+    , refusalMessage = if sc == "*" then "needs " <> g else "needs " <> g <> " on " <> sc
+    }
+  _ -> Nothing
 
 -- | Create a subscription request
 mkSubscribeRequest :: RequestId -> Text -> Value -> RpcRequest

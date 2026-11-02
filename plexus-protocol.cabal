@@ -1,6 +1,6 @@
 cabal-version:      3.0
 name:               plexus-protocol
-version:            0.5.5.0
+version:            0.6.0.0
 synopsis:           Plexus RPC protocol types and client
 description:        Haskell types and a client for Plexus RPC, a streaming JSON-RPC 2.0
                     protocol: stream items and provenance, recursive plugin and method
@@ -23,6 +23,7 @@ library
     Plexus
     Plexus.Types
     Plexus.Auth
+    Plexus.RemoteError
     Plexus.Schema
     Plexus.Schema.Cache
     Plexus.Schema.Recursive
@@ -72,3 +73,25 @@ test-suite naming-gate
   hs-source-dirs:   test
   default-language: GHC2021
   ghc-options:      -threaded -rtsopts "-with-rtsopts=-M6G"
+
+-- Golden tests against the plexus 0.7 conformance fixture (RETURNS-7), read
+-- by sibling path from ../plexus-macros/fixtures/conformance/expected/.
+test-suite plexus-protocol-test
+  type:             exitcode-stdio-1.0
+  main-is:          Main.hs
+  hs-source-dirs:   test
+  build-depends:
+    base,
+    plexus-protocol,
+    aeson,
+    bytestring,
+    containers,
+    directory,
+    filepath,
+    hspec >= 2.7,
+    text
+  default-language: GHC2021
+  default-extensions:
+    OverloadedStrings
+    LambdaCase
+  ghc-options:      -Wall
