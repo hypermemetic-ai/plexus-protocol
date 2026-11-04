@@ -310,7 +310,8 @@ remoteErrorOfFields o = case maybe code id (str "error_kind") of
     notFound
       | Just a <- T.stripPrefix "Activation not found: " message = ActivationNotFound (T.strip a)
       | Just am <- T.stripPrefix "Method not found: " message
-      , (a, m) <- T.breakOnEnd "." (T.strip am), not (T.null a) = MethodNotFound (T.dropEnd 1 a) m
+      , (a, m) <- T.breakOnEnd "." (T.strip am) = MethodNotFound (T.dropEnd 1 a) m
+        -- (no dot: the method alone, no activation — as spec05.rs reads it)
       | otherwise = MethodNotFound "" ""
     code = case KM.lookup "code" o of
       Just (String c) -> c

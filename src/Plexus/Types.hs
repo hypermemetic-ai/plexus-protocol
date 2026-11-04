@@ -725,7 +725,7 @@ progressContent o = case KM.lookup "content" o of
   Just v -> pure v
   Nothing -> pure $ Object $ KM.fromList $
     ("message", maybe (String "") id (KM.lookup "message" o))
-      : [ ("percentage", p) | Just p <- [KM.lookup "percentage" o] ]
+      : [ ("percentage", p) | Just p <- [KM.lookup "percentage" o], p /= Null ]  -- a null one left out, as spec05.rs
 
 -- | An error frame's keys beside the envelope and the typed error.
 besideError :: Object -> KM.KeyMap Value
