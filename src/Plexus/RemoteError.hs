@@ -34,11 +34,13 @@
 -- @param@ is omitted when the failure is not about one parameter, and
 -- decodes as 'Nothing' when absent or @null@.
 --
--- = Exhaustive on purpose
+-- = Open, typed
 --
--- No catch-all constructor: a @kind@, @problem@ or @reason@ this library does
--- not know is a decode error, so a new failure kind fails every receiver's
--- build until it handles it.
+-- A @kind@ this library does not know is 'Other': its kind and every other
+-- field kept, and written back exactly as they came (RETURNS-36, as
+-- plexus-client's @RemoteError::Other@). A known kind that does not fit its
+-- constructor — a @problem@ or @reason@ this library does not know, a field
+-- missing — is still a decode error.
 --
 -- The constructor names 'ActivationNotFound', 'MethodNotFound' and
 -- 'InvalidParams' are also used by 'Plexus.Types.GuidanceErrorType', so
@@ -89,6 +91,11 @@ data RemoteError
   | ChildTimeout Text Integer
     -- ^ spec/12: the child (@child@) did not open the call in the service's
     -- time (@timeout_ms@). RETURNS-36.
+  | Other Text (KM.KeyMap Value)
+    -- ^ RETURNS-36 (the Rust side's review #4): a kind this library does not
+    -- know (@kind@; menger's @too_many_connections@, @too_many_writes@ with
+    -- @retry_after_ms@) and every other field, kept and written back exactly
+    -- as they came. Mirrors plexus-client's @RemoteError::Other@.
   deriving stock (Show, Eq, Ord, Generic)
 
 -- | What is wrong with a call's params. Flattened into 'InvalidParams' under
@@ -141,7 +148,7 @@ instance FromJSON RemoteError where
       "too_many_calls"       -> TooManyCalls <$> o .: "max" <*> o .:? "child"
       "child_unavailable"    -> ChildUnavailable <$> o .: "child" <*> o .: "reason"
       "child_timeout"        -> ChildTimeout <$> o .: "child" <*> o .: "timeout_ms"
-      other -> fail $ "unknown RemoteError kind: " <> T.unpack other
+      other -> pure (Other other (KM.delete "kind" o))
 
 -- | Standalone, a 'ParamProblem' is its flattened fields:
 -- @{"problem": "missing"}@ or @{"problem": "malformed", "detail": …}@.
@@ -186,6 +193,8 @@ remoteErrorPairs = \case
     [kindPair "child_unavailable", "child" .= child, "reason" .= reason]
   ChildTimeout child ms ->
     [kindPair "child_timeout", "child" .= child, "timeout_ms" .= ms]
+  Other kind fields ->
+    kindPair kind : KM.toList (KM.delete "kind" fields)
 
 paramProblemPairs :: ParamProblem -> [Pair]
 paramProblemPairs = \case
@@ -257,6 +266,10 @@ renderRemoteError = \case
     "child " <> oneLine child <> " is unavailable: " <> oneLine reason
   ChildTimeout child ms ->
     "child " <> oneLine child <> " did not open the call in " <> T.pack (show ms) <> " ms"
+  Other kind fields ->
+    oneLine kind <> case KM.lookup "message" fields of
+      Just (String m) -> ": " <> oneLine m
+      _ -> ""
 
 oneLine :: Text -> Text
 oneLine = T.map (\c -> if c == '\n' || c == '\r' then ' ' else c)
@@ -283,6 +296,10 @@ remoteErrorOfFields o = case maybe code id (str "error_kind") of
   "too_many_calls" -> TooManyCalls (int "max") (str "child")
   "child_unavailable" -> ChildUnavailable (txt "child") (txt "reason")
   "child_timeout" -> ChildTimeout (txt "child") (int "timeout_ms")
+  -- a kind this library does not know, by its error_kind: that kind, its
+  -- fields kept (peer.rs: all but type, metadata, code and recoverable)
+  other | KM.member "error_kind" o ->
+    Other other (foldr KM.delete o ["error_kind", "type", "metadata", "code", "recoverable"])
   _ -> Execution message
   where
     str k = case KM.lookup k o of { Just (String t) -> Just t; _ -> Nothing }
