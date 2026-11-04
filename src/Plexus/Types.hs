@@ -14,6 +14,7 @@ module Plexus.Types
     -- * Plexus Stream Types
   , PlexusStreamItem(.., StreamError)
   , itemRefusal
+  , itemErrorMessage
   , Refusal(..)
   , Provenance(..)
   , StreamMetadata(..)
@@ -679,7 +680,8 @@ instance ToJSON PlexusStreamItem where
     , "metadata" .= StreamMetadata prov hash 0
     , "recoverable" .= rec
     , "error" .= err
-    ] <> if KM.null beside then refusalFields else KM.toList beside
+    ] <> (if KM.member "message" beside then [] else ["message" .= RE.renderRemoteError err])
+      <> if KM.null beside then refusalFields else KM.toList beside
     where
       -- a frame built here with a refusal: its own fields, beside the typed error
       refusalFields = case toJSON <$> refusal of
@@ -697,6 +699,15 @@ instance ToJSON PlexusStreamItem where
     [ "type" .= ("done" :: Text)
     , "metadata" .= StreamMetadata prov hash 0
     ]
+
+-- | RETURNS-36 review: the server's own line for an error frame — its
+--   @message@, as plexus-core writes it on every error frame (and the 0.7.0
+--   line did) — when the frame came with one; 'Nothing' for a frame built
+--   here or sent without it. A caller shows it, and reads it, as main did.
+itemErrorMessage :: PlexusStreamItem -> Maybe Text
+itemErrorMessage = \case
+  StreamErrorWith _ _ _ _ _ beside | Just (String m) <- KM.lookup "message" beside -> Just m
+  _ -> Nothing
 
 -- | An error frame's typed error: its @error@ (plexus 0.8), else — a frame
 --   of the published 0.7.0 line — what its spec/05 fields say

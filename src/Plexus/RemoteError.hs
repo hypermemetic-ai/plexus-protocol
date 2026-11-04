@@ -279,6 +279,7 @@ remoteErrorOfFields o = case maybe code id (str "error_kind") of
         Just "tenant_boundary" -> TenantBoundary
         Just "not_accepted" -> NotAccepted
         _ -> MissingGrant (txt "grant") (txt "scope") (strings "roles") (strings "held_on")
+  "-32601" -> notFound
   "too_many_calls" -> TooManyCalls (int "max") (str "child")
   "child_unavailable" -> ChildUnavailable (txt "child") (txt "reason")
   "child_timeout" -> ChildTimeout (txt "child") (int "timeout_ms")
@@ -287,6 +288,13 @@ remoteErrorOfFields o = case maybe code id (str "error_kind") of
     str k = case KM.lookup k o of { Just (String t) -> Just t; _ -> Nothing }
     txt k = maybe "" id (str k)
     message = txt "message"
+    -- spec/05: -32601 is an activation or a method not found; its message
+    -- says which ("Activation not found: X", "Method not found: A.M")
+    notFound
+      | Just a <- T.stripPrefix "Activation not found: " message = ActivationNotFound (T.strip a)
+      | Just am <- T.stripPrefix "Method not found: " message
+      , (a, m) <- T.breakOnEnd "." (T.strip am), not (T.null a) = MethodNotFound (T.dropEnd 1 a) m
+      | otherwise = MethodNotFound "" ""
     code = case KM.lookup "code" o of
       Just (String c) -> c
       Just n@(Number _) | Success i <- fromJSON n -> T.pack (show (i :: Integer))
