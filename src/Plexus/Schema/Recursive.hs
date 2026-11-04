@@ -33,6 +33,7 @@ module Plexus.Schema.Recursive
   , ChildSummary(..)
   , PluginHash
   , SchemaResult(..)
+  , Cardinality(..)
 
     -- * Deprecation Metadata (IR-5)
   , DeprecationInfo(..)
@@ -64,7 +65,7 @@ module Plexus.Schema.Recursive
 import Control.Applicative ((<|>))
 
 import Data.Aeson
-import Data.Aeson.Types (Parser)
+import Data.Aeson.Types (Pair, Parser)
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import Data.Maybe (catMaybes, fromMaybe)
@@ -208,15 +209,45 @@ instance ToJSON ChildSummary where
     , "hash"        .= csHash
     ]
 
--- | Schema for a single method
+-- | Whether a method yields one item or many (plexus 0.7).
+--
+--   Mirrors the Rust @plexus_core::Cardinality@; on the wire @"one"@ /
+--   @"many"@. Read from the method's signature: a plain return type is one
+--   item, @impl Stream@ is many.
+data Cardinality
+  = CardinalityOne   -- ^ The method yields exactly one item.
+  | CardinalityMany  -- ^ The method yields a stream of zero or more items.
+  deriving stock (Show, Eq, Ord, Generic)
+
+instance FromJSON Cardinality where
+  parseJSON = withText "Cardinality" $ \case
+    "one"  -> pure CardinalityOne
+    "many" -> pure CardinalityMany
+    other  -> fail $ "unknown cardinality: " <> T.unpack other
+
+instance ToJSON Cardinality where
+  toJSON CardinalityOne  = String "one"
+  toJSON CardinalityMany = String "many"
+
+-- | Schema for a single method (plexus 0.7)
+--
+--   A method's contract is its item type @T@ ('methodReturns'), its error
+--   type @E@ when it can say no ('methodError'), its progress type @P@ when
+--   it reports progress ('methodProgress'), and its 'methodCardinality'.
+--   @returns@ and @cardinality@ are required on the wire: a schema that does
+--   not state them is not a 0.7 schema, and is a decode error rather than a
+--   guess.
 data MethodSchema = MethodSchema
   { methodName            :: Text
   , methodDescription     :: Text
   , methodHash            :: PluginHash
   , methodParams          :: Maybe Value  -- ^ JSON Schema for params
-  , methodReturns         :: Maybe Value  -- ^ JSON Schema for return events
-  , methodStreaming        :: Bool         -- ^ True if method streams multiple events
+  , methodReturns         :: Value        -- ^ JSON Schema for the item type @T@ — what one success carries (for @Result<T, E>@ or @Progress<T, P>@, @T@ alone)
+  , methodError           :: Maybe Value  -- ^ JSON Schema for the error type @E@ (@-> Result<T, E>@); 'Nothing' when the method is infallible
+  , methodProgress        :: Maybe Value  -- ^ JSON Schema for the progress type @P@ carried by progress frames; 'Nothing' when the method reports no progress
+  , methodCardinality     :: Cardinality  -- ^ One item or many
   , methodBidirectional   :: Bool         -- ^ True if method uses a bidirectional channel
+  , methodHttpMethod      :: Text         -- ^ HTTP method of the method's REST endpoint (@"GET"@, @"POST"@, …); @"POST"@ when absent
   , methodRequestType     :: Maybe Value  -- ^ JSON Schema for the server→client request type (when bidirectional)
   , methodResponseType    :: Maybe Value  -- ^ JSON Schema for the client→server response type (when bidirectional)
   , methodDeprecation     :: Maybe DeprecationInfo  -- ^ Deprecation info, if any (IR-5)
@@ -240,9 +271,12 @@ instance FromJSON MethodSchema where
     <*> o .:? "description" .!= ""
     <*> o .:? "hash" .!= ""
     <*> o .:? "params"
-    <*> o .:? "returns"
-    <*> o .:? "streaming"      .!= False
+    <*> returnsOf o
+    <*> o .:? "error"
+    <*> o .:? "progress"
+    <*> cardinalityOf o
     <*> o .:? "bidirectional"  .!= False
+    <*> o .:? "http_method"    .!= "POST"
     <*> o .:? "request_type"
     <*> o .:? "response_type"
     <*> o .:? "deprecation"
@@ -258,29 +292,54 @@ instance FromJSON MethodSchema where
     <*> (o .:? "examples" .!= [] <|> pure [])
     <*> o .:? "input"
 
+-- | RETURNS-36: a method's cardinality — its @cardinality@ (plexus 0.8);
+--   else, a method of the published 0.7.0 line, its own @streaming@ flag
+--   (@true@ many, @false@ one), as plexus-core's child seam reads it; a
+--   method that states neither is refused.
+cardinalityOf :: Object -> Parser Cardinality
+cardinalityOf o = case KM.lookup "cardinality" o of
+  Just c -> parseJSON c
+  Nothing -> case KM.lookup "streaming" o of
+    Just (Bool True) -> pure CardinalityMany
+    Just (Bool False) -> pure CardinalityOne
+    _ -> fail "a method states neither cardinality (plexus 0.8) nor streaming (0.7.0)"
+
+-- | RETURNS-36: a method's @returns@ — required of a 0.8 method (one that
+--   states its cardinality); a 0.7.0 method's missing one is the empty
+--   schema, @{}@.
+returnsOf :: Object -> Parser Value
+returnsOf o
+  | KM.member "cardinality" o = o .: "returns"
+  | otherwise = o .:? "returns" .!= Object KM.empty
+
+-- | Encodes as the Rust @MethodSchema@ serializes: an absent optional field
+--   is omitted, not @null@.
 instance ToJSON MethodSchema where
   toJSON MethodSchema{..} = object $
     [ "name"           .= methodName
     , "description"    .= methodDescription
     , "hash"           .= methodHash
-    , "params"         .= methodParams
     , "returns"        .= methodReturns
-    , "streaming"      .= methodStreaming
+    , "cardinality"    .= methodCardinality
     , "bidirectional"  .= methodBidirectional
-    , "request_type"   .= methodRequestType
-    , "response_type"  .= methodResponseType
-    , "deprecation"    .= methodDeprecation
-    , "param_schemas"  .= methodParamSchemas
+    , "http_method"    .= methodHttpMethod
     , "role"           .= methodRole
     ] <> catMaybes
-    [ ("long_description" .=) <$> methodLongDescription
-    , ("grant"            .=) <$> methodGrant
-    , ("target"           .=) <$> methodTarget
-    , ("held_on"          .=) <$> methodHeldOn
+    [ "params"         .=? methodParams
+    , "error"          .=? methodError
+    , "progress"       .=? methodProgress
+    , "request_type"   .=? methodRequestType
+    , "response_type"  .=? methodResponseType
+    , "deprecation"    .=? methodDeprecation
+    , "param_schemas"  .=? methodParamSchemas
+    , "long_description" .=? methodLongDescription
+    , "grant"            .=? methodGrant
+    , "target"           .=? methodTarget
+    , "held_on"          .=? methodHeldOn
     , if methodPublic then Just ("public" .= True) else Nothing
-    , ("group"            .=) <$> methodGroup
+    , "group"            .=? methodGroup
     , if null methodExamples then Nothing else Just ("examples" .= methodExamples)
-    , ("input"            .=) <$> methodInput
+    , "input"            .=? methodInput
     ]
 
 -- | SYNAPSE-13: one worked call of a method — the params it sends and a
@@ -322,10 +381,14 @@ data PluginSchema = PluginSchema
   , psVersion         :: Text
   , psDescription     :: Text
   , psLongDescription :: Maybe Text  -- ^ Extended description (no word limit)
+  , psSelfHash        :: Maybe PluginHash  -- ^ Hash of this plugin's own methods, children aside (@self_hash@)
   , psHash            :: PluginHash
   , psMethods         :: [MethodSchema]
   , psChildren        :: Maybe [ChildSummary]  -- ^ Nothing = leaf, Just = parent activation
   , psDeprecation     :: Maybe DeprecationInfo -- ^ Activation-level deprecation (IR-5)
+  , psRequest         :: Maybe Value  -- ^ JSON Schema of the activation's request type (@request@): each
+                                      --   property carries @x-plexus-source@ (cookie, header, query, peer);
+                                      --   Nothing when the activation declares none (CONTEXT-5)
   , psRoles           :: Maybe (Map Text [Text]) -- ^ AUTH-3: the activation's default roles, each its grants
   , psView            :: Maybe View            -- ^ AUTH-4: which view this schema answers from
   }
@@ -338,27 +401,38 @@ instance FromJSON PluginSchema where
     <*> o .:? "version" .!= ""
     <*> o .:? "description" .!= ""
     <*> o .:? "long_description"
+    <*> o .:? "self_hash"
     <*> o .:? "hash" .!= ""
     <*> o .:? "methods" .!= []
     <*> o .:? "children"
     <*> o .:? "deprecation"
+    <*> o .:? "request"
     <*> (o .:? "roles" <|> pure Nothing)
     <*> (o .:? "view" <|> pure Nothing)
 
+-- | Encodes as the Rust @PluginSchema@ serializes: an absent optional field
+--   is omitted, not @null@.
 instance ToJSON PluginSchema where
   toJSON PluginSchema{..} = object $
     [ "namespace"        .= psNamespace
     , "version"          .= psVersion
     , "description"      .= psDescription
-    , "long_description" .= psLongDescription
     , "hash"             .= psHash
     , "methods"          .= psMethods
-    , "children"         .= psChildren
-    , "deprecation"      .= psDeprecation
     ] <> catMaybes
-    [ ("roles" .=) <$> psRoles
-    , ("view"  .=) <$> psView
+    [ "long_description" .=? psLongDescription
+    , "self_hash"        .=? psSelfHash
+    , "children"         .=? psChildren
+    , "deprecation"      .=? psDeprecation
+    , "request"          .=? psRequest
+    , "roles"            .=? psRoles
+    , "view"             .=? psView
     ]
+
+-- | A key whose value is omitted when 'Nothing'.
+(.=?) :: ToJSON v => Key -> Maybe v -> Maybe Pair
+k .=? v = (k .=) <$> v
+infixr 8 .=?
 
 -- | Result of a schema query - can be either a full plugin or just a method
 data SchemaResult

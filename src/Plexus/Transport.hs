@@ -45,6 +45,7 @@ import System.IO.Unsafe (unsafePerformIO)
 
 import Plexus.Client (SubstrateConfig(..), LostConnection(..), connect, disconnect, substrateRpc, substrateRpcWith, defaultConfig)
 import Plexus.Client.Pool (ConnectionPool, createConnectionPool, withPooledConnection, defaultPlexusPoolConfig)
+import Plexus.RemoteError (renderRemoteError)
 import Plexus.Types (PlexusStreamItem(..), TransportError(..), Response(..), StandardResponse)
 import Plexus.Schema.Recursive (PluginSchema, MethodSchema, SchemaResult(..), parsePluginSchema, parseSchemaResult)
 
@@ -207,7 +208,7 @@ extractSchema :: [PlexusStreamItem] -> Either Text PluginSchema
 extractSchema items =
   case [dat | StreamData _ _ ct dat <- items, ".schema" `T.isSuffixOf` ct] of
     (dat:_) -> parsePluginSchema dat
-    [] -> case [err | StreamError _ _ err _ <- items] of
+    [] -> case [renderRemoteError err | StreamError _ _ err _ <- items] of
       (err:_) -> Left err
       [] -> Left "No schema in response"
 
@@ -235,7 +236,7 @@ extractSchemaResult :: [PlexusStreamItem] -> Either Text SchemaResult
 extractSchemaResult items =
   case [dat | StreamData _ _ ct dat <- items, ".schema" `T.isSuffixOf` ct] of
     (dat:_) -> parseSchemaResult dat
-    [] -> case [err | StreamError _ _ err _ <- items] of
+    [] -> case [renderRemoteError err | StreamError _ _ err _ <- items] of
       (err:_) -> Left err
       [] -> Left "No schema in response"
 
@@ -267,6 +268,6 @@ sendBidirectionalResponse cfg requestId response = do
   result <- rpcCallWith cfg (backend <> ".respond") respondParams
   case result of
     Left transportErr -> pure $ Left transportErr
-    Right items -> case [err | StreamError _ _ err _ <- items] of
+    Right items -> case [renderRemoteError err | StreamError _ _ err _ <- items] of
       (err:_) -> pure $ Left $ ProtocolError err
       [] -> pure $ Right ()
