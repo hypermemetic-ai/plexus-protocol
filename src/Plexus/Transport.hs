@@ -11,6 +11,7 @@ module Plexus.Transport
   , rpcCallStreaming
   , invokeMethodStreaming
   , invokeMethodStreamingWith
+  , invokeMethodDuplex
 
     -- * Bidirectional Response
   , sendBidirectionalResponse
@@ -28,6 +29,8 @@ module Plexus.Transport
     -- * Routing a call elsewhere (SYNAPSE-28)
   , CallRoute
   , setCallRouter
+  , DuplexRoute
+  , setDuplexRouter
   ) where
 
 import Control.Exception (SomeException, IOException, catch, fromException)
@@ -43,7 +46,8 @@ import qualified Streaming.Prelude as S
 import qualified Network.Socket as NS
 import System.IO.Unsafe (unsafePerformIO)
 
-import Plexus.Client (SubstrateConfig(..), LostConnection(..), connect, disconnect, substrateRpc, substrateRpcWith, defaultConfig)
+import Plexus.Client (SubstrateConfig(..), LostConnection(..), connect, disconnect, substrateRpc, substrateRpcDuplex, defaultConfig)
+import Plexus.Input (InputHalf)
 import Plexus.Client.Pool (ConnectionPool, createConnectionPool, withPooledConnection, defaultPlexusPoolConfig)
 import Plexus.RemoteError (renderRemoteError)
 import Plexus.Types (PlexusStreamItem(..), TransportError(..), Response(..), StandardResponse)
@@ -72,15 +76,30 @@ getOrCreatePool cfg = modifyMVar poolCache $ \pools ->
 -- call), so everything above it reads its failures as before.
 type CallRoute = IO () -> Text -> Value -> (PlexusStreamItem -> IO ()) -> IO ()
 
+-- | BIDIR-18: a route that can also carry a call's input half
+-- (plexus-wire spec/10): given 'Just' a half, it hands the half the call's
+-- 'Plexus.Input.InputPort' once the subscription is known and its signals
+-- as they come; given 'Nothing', it is a 'CallRoute'.
+type DuplexRoute = Maybe InputHalf -> CallRoute
+
 {-# NOINLINE routerRef #-}
-routerRef :: IORef (SubstrateConfig -> Maybe CallRoute)
+routerRef :: IORef (SubstrateConfig -> Maybe DuplexRoute)
 routerRef = unsafePerformIO (newIORef (const Nothing))
 
 -- | SYNAPSE-28: route the calls whose config the router answers 'Just'
 -- for; the rest go through this process's pools, as before. Set once, at
--- start (a program that never sets it is unchanged).
+-- start (a program that never sets it is unchanged). A route set here
+-- cannot carry an input half: a call with one fails on it, naming why
+-- ('setDuplexRouter' sets one that can).
 setCallRouter :: (SubstrateConfig -> Maybe CallRoute) -> IO ()
-setCallRouter = writeIORef routerRef
+setCallRouter f = writeIORef routerRef (fmap plainOnly . f)
+  where
+    plainOnly r Nothing = r
+    plainOnly _ (Just _) = \_ _ _ _ -> E.throwIO (userError "this call route cannot carry a call's input half")
+
+-- | BIDIR-18: 'setCallRouter' with routes that carry an input half too.
+setDuplexRouter :: (SubstrateConfig -> Maybe DuplexRoute) -> IO ()
+setDuplexRouter = writeIORef routerRef
 
 -- | Low-level RPC call with default localhost config
 rpcCall :: Text -> Text -> Value -> IO (Either TransportError [PlexusStreamItem])
@@ -136,7 +155,7 @@ doCallInner cfg method params = do
   case router cfg of
     Just route -> do
       acc <- newIORef []
-      route (pure ()) method params (\i -> modifyIORef' acc (i :))
+      route Nothing (pure ()) method params (\i -> modifyIORef' acc (i :))
       reverse <$> readIORef acc
     Nothing -> freshIfUnsent $ do
       pool <- getOrCreatePool cfg
@@ -162,14 +181,17 @@ doCallStreaming :: SubstrateConfig -> Text -> Value -> (PlexusStreamItem -> IO (
 doCallStreaming cfg = doCallStreamingWith cfg (pure ())
 
 doCallStreamingWith :: SubstrateConfig -> IO () -> Text -> Value -> (PlexusStreamItem -> IO ()) -> IO ()
-doCallStreamingWith cfg onSubscribed method params onItem = do
+doCallStreamingWith cfg = doCallDuplex cfg Nothing
+
+doCallDuplex :: SubstrateConfig -> Maybe InputHalf -> IO () -> Text -> Value -> (PlexusStreamItem -> IO ()) -> IO ()
+doCallDuplex cfg half onSubscribed method params onItem = do
   router <- readIORef routerRef
   case router cfg of
-    Just route -> route onSubscribed method params onItem
+    Just route -> route half onSubscribed method params onItem
     Nothing -> freshIfUnsent $ do
       pool <- getOrCreatePool cfg
       withPooledConnection pool $ \conn ->
-        S.mapM_ onItem $ substrateRpcWith conn onSubscribed method params
+        S.mapM_ onItem $ substrateRpcDuplex conn half (const onSubscribed) method params
 
 -- | Streaming method invocation
 invokeMethodStreaming :: SubstrateConfig -> [Text] -> Text -> Value -> (PlexusStreamItem -> IO ()) -> IO (Either TransportError ())
@@ -184,6 +206,20 @@ invokeMethodStreamingWith cfg onSubscribed namespacePath method params onItem = 
   let dotPath = T.intercalate "." (fullPath ++ [method])
   let callParams = object ["method" .= dotPath, "params" .= params]
   (Right <$> doCallStreamingWith cfg onSubscribed (backend <> ".call") callParams onItem)
+    `catch` categorizeException cfg
+
+-- | BIDIR-18: 'invokeMethodStreamingWith' for a method with an input half:
+-- the half is handed its port once the server has taken the call (before
+-- @onSubscribed@) and the callee's credit, acks and close as they come.
+-- Nothing here sends the call twice: a call whose request went out and
+-- whose connection went is 'ConnectionLost' with @sent@.
+invokeMethodDuplex :: SubstrateConfig -> InputHalf -> IO () -> [Text] -> Text -> Value -> (PlexusStreamItem -> IO ()) -> IO (Either TransportError ())
+invokeMethodDuplex cfg half onSubscribed namespacePath method params onItem = do
+  let backend = substrateBackend cfg
+  let fullPath = if null namespacePath then [backend] else namespacePath
+  let dotPath = T.intercalate "." (fullPath ++ [method])
+  let callParams = object ["method" .= dotPath, "params" .= params]
+  (Right <$> doCallDuplex cfg (Just half) onSubscribed (backend <> ".call") callParams onItem)
     `catch` categorizeException cfg
 
 -- | Fetch schema at a specific path
