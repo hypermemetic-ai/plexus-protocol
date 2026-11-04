@@ -373,10 +373,34 @@ remoteErrorSpec = describe "RemoteError (RETURNS-4 wire literals)" $ do
     decodes (object ["kind" .= s "invalid_params", "param" .= Null, "problem" .= s "missing"])
       `shouldBe` Right (InvalidParams Nothing Missing)
 
-  it "a kind, reason or problem it does not know is a decode error, naming it" $
+  -- RETURNS-36 (the Rust side's review #4, plexus-client's remote_error.rs):
+  -- a kind this build does not know is RemoteError's open variant, its kind
+  -- and every other field kept and written back exactly as they came; a
+  -- known kind that does not fit (a reason or problem it does not know) is
+  -- still a decode error
+  it "an unknown kind is kept with every field and written back as it came" $
     forM_
-      [ (object ["kind" .= s "rate_limited"], "rate_limited")
-      , (object ["kind" .= s "forbidden", "reason" .= s "too_tall"], "too_tall")
+      [ object ["kind" .= s "too_many_connections", "max" .= (64 :: Int)]
+      , object ["kind" .= s "too_many_writes", "retry_after_ms" .= (250 :: Int), "message" .= s "slow down"]
+      ] $ \wire -> do
+        e <- either fail pure (decodes @RemoteError wire)
+        toJSON e `shouldBe` wire
+        case e of
+          Other k _ -> Just k `shouldBe` (field "kind" wire >>= \case { String t -> Just t; _ -> Nothing })
+          _ -> expectationFailure ("not the open variant: " <> show e)
+
+  it "an unknown kind renders as its kind and message, as the Rust Display" $ do
+    e <- either fail pure (decodes @RemoteError (object ["kind" .= s "too_many_writes", "retry_after_ms" .= (250 :: Int), "message" .= s "slow down"]))
+    renderRemoteError e `shouldBe` "too_many_writes: slow down"
+    c <- either fail pure (decodes @RemoteError (object ["kind" .= s "too_many_connections", "max" .= (64 :: Int)]))
+    renderRemoteError c `shouldBe` "too_many_connections"
+
+  it "a known kind is not the open one" $
+    decodes @RemoteError (object ["kind" .= s "unauthenticated"]) `shouldBe` Right Unauthenticated
+
+  it "a reason or problem it does not know is a decode error, naming it" $
+    forM_
+      [ (object ["kind" .= s "forbidden", "reason" .= s "too_tall"], "too_tall")
       , (object ["kind" .= s "invalid_params", "param" .= s "id", "problem" .= s "smelly"], "smelly")
       ] $ \(wire, name) -> case decodes @RemoteError wire of
         Right e -> expectationFailure ("decoded " <> show e <> " from " <> encodeStr wire)
@@ -443,9 +467,9 @@ rejectionSpec = describe "JSON-RPC rejection" $ do
     decodes (object ["code" .= (-32602 :: Int), "message" .= s "Invalid params", "data" .= s "missing field `method`"])
       `shouldBe` Right (RpcErrorObj (-32602) "Invalid params" Nothing)
 
-  it "a kind-tagged data of an unknown kind is a decode error" $
-    decodes @RpcError (object ["code" .= (-32000 :: Int), "message" .= s "x", "data" .= object ["kind" .= s "rate_limited"]])
-      `shouldSatisfy` isLeft
+  it "a kind-tagged data of an unknown kind is the open variant" $
+    fmap errData (decodes @RpcError (object ["code" .= (-32000 :: Int), "message" .= s "x", "data" .= object ["kind" .= s "rate_limited"]]))
+      `shouldBe` Right (Just (Other "rate_limited" mempty))
 
 strictnessSpec :: Spec
 strictnessSpec = describe "0.7 shapes are required, not defaulted" $ do
@@ -630,6 +654,28 @@ mergedSpec = describe "0.7 merged with main's auth (RETURNS-36)" $ do
     field "message" (toJSON item) `shouldBe` Just (String "execution failed: boom")
     itemErrorMessage item `shouldBe` Nothing
     fmap itemError (decodes @PlexusStreamItem (toJSON item)) `shouldBe` Right (Execution "boom")
+
+  -- the Rust side's review: a frame's message is optional on reading
+  -- (plexus-core always writes it); without it a caller renders the typed error
+  it "an error frame without message reads; written back with one" $ do
+    item <- either fail pure $ decodes @PlexusStreamItem
+      (object ["type" .= s "error", meta, "recoverable" .= False, "error" .= object ["kind" .= s "unauthenticated"]])
+    itemError item `shouldBe` Unauthenticated
+    itemErrorMessage item `shouldBe` Nothing
+    field "message" (toJSON item) `shouldBe` Just (String "unauthenticated: credentials required")
+
+  it "an error frame whose typed error is an unknown kind round-trips" $ do
+    item <- roundTrips @PlexusStreamItem id $ object
+      [ "type" .= s "error", meta, "recoverable" .= False, "message" .= s "too_many_writes: slow down", "code" .= s "too_many_writes"
+      , "error" .= object ["kind" .= s "too_many_writes", "retry_after_ms" .= (250 :: Int), "message" .= s "slow down"]
+      , "error_kind" .= s "too_many_writes", "retry_after_ms" .= (250 :: Int) ]
+    renderRemoteError (itemError item) `shouldBe` "too_many_writes: slow down"
+
+  it "a 0.7.0 frame with an unknown error_kind is that kind, its fields kept (peer.rs)" $ do
+    item <- either fail pure $ decodes @PlexusStreamItem $ object
+      [ "type" .= s "error", meta, "recoverable" .= False, "code" .= s "too_many_writes"
+      , "error_kind" .= s "too_many_writes", "retry_after_ms" .= (250 :: Int), "message" .= s "slow down" ]
+    toJSON (itemError item) `shouldBe` object ["kind" .= s "too_many_writes", "retry_after_ms" .= (250 :: Int), "message" .= s "slow down"]
 
   it "any other typed error has no refusal" $ do
     item <- either fail pure $ decodes @PlexusStreamItem
