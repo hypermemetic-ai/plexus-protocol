@@ -23,6 +23,7 @@ module Plexus.Client
   , substrateRpc
   , substrateRpcWith
   , substrateRpcSub
+  , substrateRpcDuplex
   , unsubscribe
 
     -- * Configuration
@@ -67,6 +68,7 @@ import System.X509 (getSystemCertificateStore)
 import Streaming
 import qualified Streaming.Prelude as Str
 
+import Plexus.Input (InputHalf(..), InputPort(..), inputSignal, inputFrame, endFrame, binaryFrame, inputNamespace, subscriptionWord)
 import Plexus.RemoteError (RemoteError(..))
 import Plexus.Types
 
@@ -387,6 +389,26 @@ unsubscribe conn unsubMethod subId = do
     decodeStrictText :: Text -> Maybe Value
     decodeStrictText = decode . LBS.fromStrict . BS8.pack . T.unpack
 
+-- | BIDIR-18: the input port of a call on this connection: its frames
+-- addressed to @ns@ and the subscription, sent on this socket. A send that
+-- fails is the connection's loss, after the call's request went out.
+connectionPort :: SubstrateConnection -> Text -> SubscriptionId -> InputPort
+connectionPort conn ns sid = InputPort
+  { ipItems = \sq items -> sending (WS.sendTextData (scConnection conn) (inputFrame ns sid sq items))
+  , ipBinary = \sq payload -> case subscriptionWord sid of
+      Just w -> sending (WS.sendBinaryData (scConnection conn) (binaryFrame w sq payload))
+      Nothing -> throwIO (userError ("a binary input frame needs an integer subscription id, not " <> T.unpack (unSubscriptionId sid)))
+  , ipEnd = \sq -> sending (WS.sendTextData (scConnection conn) (endFrame ns sid sq))
+  }
+  where
+    sending act = do
+      gone <- connectionLost conn
+      case gone of
+        Just why -> throwIO (LostConnection why True)
+        Nothing -> act `catch` \(e :: SomeException) -> do
+          why <- maybe (describeEnd e) id <$> connectionLost conn
+          throwIO (LostConnection why True)
+
 -- | Disconnect from substrate
 disconnect :: SubstrateConnection -> IO ()
 disconnect SubstrateConnection{..} = do
@@ -501,7 +523,22 @@ substrateRpcSub
   -> Text
   -> Value
   -> Stream (Of PlexusStreamItem) IO ()
-substrateRpcSub conn onSubscribed method params = do
+substrateRpcSub conn = substrateRpcDuplex conn Nothing
+
+-- | BIDIR-18: 'substrateRpcSub' for a call with an input half
+-- (plexus-wire spec/10). Once the subscription is known the half's port is
+-- handed over — before @onSubscribed@, so a caller told the call was taken
+-- can send — and each @credit@, @ack@ and @input_closed@ goes to its
+-- signal handler, never into the stream. Without a half, those three are
+-- dropped (a method without input never sends them).
+substrateRpcDuplex
+  :: SubstrateConnection
+  -> Maybe InputHalf
+  -> (SubscriptionId -> IO ())
+  -> Text
+  -> Value
+  -> Stream (Of PlexusStreamItem) IO ()
+substrateRpcDuplex conn half onSubscribed method params = do
   -- SYNAPSE-20: a connection already gone (it died idle in a pool) takes
   -- no request; nothing was sent, so the caller may always try again
   gone <- liftIO $ connectionLost conn
@@ -562,6 +599,7 @@ substrateRpcSub conn onSubscribed method params = do
           pure ()
 
         Success subId -> do
+          liftIO $ mapM_ (\h -> ihPort h (connectionPort conn (inputNamespace method) subId)) half
           liftIO (onSubscribed subId)
           -- Stream items until done, cleanup when finished
           streamItems queue subId <* liftIO (cleanup subId)
@@ -578,6 +616,14 @@ substrateRpcSub conn onSubscribed method params = do
     streamItems :: TQueue Value -> SubscriptionId -> Stream (Of PlexusStreamItem) IO ()
     streamItems queue subId = do
       val <- liftIO $ next queue
+      case inputSignal val of
+        Just sig -> do
+          liftIO $ mapM_ (\h -> ihSignal h sig) half
+          streamItems queue subId
+        Nothing -> item val queue subId
+
+    item :: Value -> TQueue Value -> SubscriptionId -> Stream (Of PlexusStreamItem) IO ()
+    item val queue subId =
       case fromJSON val of
         Error err -> do
           liftIO $ putStrLn $ "Failed to parse stream item: " <> err
