@@ -532,7 +532,10 @@ strictnessSpec = describe "0.7 shapes are required, not defaulted" $ do
     typed ["message" .= s "busy", "error_kind" .= s "too_many_calls", "max" .= (8 :: Int)] `shouldBe` TooManyCalls 8 Nothing
     typed ["error_kind" .= s "child_unavailable", "child" .= s "echo", "reason" .= s "closed"] `shouldBe` ChildUnavailable "echo" "closed"
     typed ["error_kind" .= s "child_timeout", "child" .= s "echo", "timeout_ms" .= (5000 :: Int)] `shouldBe` ChildTimeout "echo" 5000
-    typed ["message" .= s "Method not found: a.b", "code" .= s "-32601"] `shouldBe` Execution "Method not found: a.b"
+    -- spec/05: -32601 is an activation or method not found, its message naming which
+    typed ["message" .= s "Method not found: tickets.nosuch", "code" .= s "-32601"] `shouldBe` MethodNotFound "tickets" "nosuch"
+    typed ["message" .= s "Activation not found: nosuch", "code" .= s "-32601"] `shouldBe` ActivationNotFound "nosuch"
+    typed ["message" .= s "Method not found: tickets.inputs.nosuch", "code" .= s "-32601"] `shouldBe` MethodNotFound "tickets.inputs" "nosuch"
     itemRefusal (either error id (decodes @PlexusStreamItem (frame
       [ "message" .= s "needs x", "error_kind" .= s "forbidden", "grant" .= s "tickets.get", "scope" .= s "*" ])))
       `shouldSatisfy` maybe False ((== Just "tickets.get") . refusalGrant)
@@ -570,7 +573,8 @@ mergedSpec = describe "0.7 merged with main's auth (RETURNS-36)" $ do
 
   it "an error frame whose typed error is a missing grant names its refusal" $ do
     item <- roundTrips @PlexusStreamItem id
-      (object ["type" .= s "error", meta, "recoverable" .= False, "error" .= grantWire])
+      (object ["type" .= s "error", meta, "recoverable" .= False, "error" .= grantWire
+              , "message" .= s "needs tickets.set_status on IDENTITY"])
     itemError item `shouldBe` grantErr
     itemErrorRefusal item `shouldBe` Nothing
     itemRefusal item `shouldBe` Just refusal
@@ -578,6 +582,7 @@ mergedSpec = describe "0.7 merged with main's auth (RETURNS-36)" $ do
   it "AUTH-2's refusal fields beside the typed error are kept and re-encoded" $ do
     let wire = object
           [ "type" .= s "error", meta, "recoverable" .= False, "error" .= grantWire
+          , "message" .= s "needs tickets.set_status on IDENTITY", "code" .= s "-32003"
           , "error_kind" .= s "forbidden", "grant" .= s "tickets.set_status", "scope" .= s "IDENTITY"
           , "roles" .= [s "editor", s "admin"], "held_on" .= [s "DOCS"] ]
     item <- roundTrips @PlexusStreamItem id wire
@@ -591,6 +596,40 @@ mergedSpec = describe "0.7 merged with main's auth (RETURNS-36)" $ do
       , "message" .= s "Invalid params: missing field: id", "code" .= s "-32602", "error_kind" .= s "invalid_params" ]
     itemError item `shouldBe` InvalidParams (Just "id") Missing
     itemRefusal item `shouldBe` Nothing
+
+  -- the review (RETURNS-36 #1): the frames plexus-core 0.8 writes
+  -- (PlexusStreamItem::from_plexus_error: message, code, the typed error and
+  -- spec/05's fields), and the server's message as callers read it
+  it "a signed-out session's frame, as plexus-core 0.8 writes it: unauthenticated, the server's message kept" $ do
+    item <- roundTrips @PlexusStreamItem id $ object
+      [ "type" .= s "error", meta, "recoverable" .= False
+      , "message" .= s "Authentication required: you have signed out: sign in again", "code" .= s "-32001"
+      , "error" .= object ["kind" .= s "unauthenticated"], "error_kind" .= s "unauthenticated" ]
+    itemError item `shouldBe` Unauthenticated
+    itemErrorMessage item `shouldBe` Just "Authentication required: you have signed out: sign in again"
+
+  it "a missing param's frame, as plexus-core 0.8 writes it" $ do
+    item <- roundTrips @PlexusStreamItem id $ object
+      [ "type" .= s "error", meta, "recoverable" .= False
+      , "message" .= s "Invalid params: missing field: id", "code" .= s "-32602"
+      , "error" .= object ["kind" .= s "invalid_params", "param" .= s "id", "problem" .= s "missing"]
+      , "error_kind" .= s "invalid_params" ]
+    itemError item `shouldBe` InvalidParams (Just "id") Missing
+    itemErrorMessage item `shouldBe` Just "Invalid params: missing field: id"
+
+  it "a 0.7.0 frame's message is the server's too" $ do
+    item <- either fail pure $ decodes @PlexusStreamItem
+      (object ["type" .= s "error", meta, "message" .= s "your sign-in has expired: sign in again", "code" .= s "-32001", "recoverable" .= False])
+    itemError item `shouldBe` Unauthenticated
+    itemErrorMessage item `shouldBe` Just "your sign-in has expired: sign in again"
+
+  -- review §4: an error frame written here carries message, so plexus-core
+  -- (whose frame requires it) reads it
+  it "an error frame built here is written with its message" $ do
+    let item = StreamError "h" (Provenance ["tickets"]) (Execution "boom") False
+    field "message" (toJSON item) `shouldBe` Just (String "execution failed: boom")
+    itemErrorMessage item `shouldBe` Nothing
+    fmap itemError (decodes @PlexusStreamItem (toJSON item)) `shouldBe` Right (Execution "boom")
 
   it "any other typed error has no refusal" $ do
     item <- either fail pure $ decodes @PlexusStreamItem
