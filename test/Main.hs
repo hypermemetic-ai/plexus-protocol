@@ -532,6 +532,13 @@ strictnessSpec = describe "0.7 shapes are required, not defaulted" $ do
       StreamProgress _ _ _ c -> c `shouldBe` object ["message" .= s "half", "percentage" .= (50 :: Int)]
       other -> expectationFailure (show other)
 
+  it "a 0.7.0 progress frame's null percentage is left out, as spec05.rs reads it" $ do
+    item <- either fail pure $ decodes @PlexusStreamItem
+      (object ["type" .= s "progress", meta, "message" .= s "started", "percentage" .= Null])
+    case item of
+      StreamProgress _ _ _ c -> c `shouldBe` object ["message" .= s "started"]
+      other -> expectationFailure (show other)
+
   it "a 0.7.0 error frame (message, code) reads typed from its fields, and keeps them" $ do
     let wire = object ["type" .= s "error", meta, "message" .= s "boom", "code" .= s "-32000", "recoverable" .= False]
     item <- either fail pure $ decodes @PlexusStreamItem wire
@@ -560,6 +567,8 @@ strictnessSpec = describe "0.7 shapes are required, not defaulted" $ do
     typed ["message" .= s "Method not found: tickets.nosuch", "code" .= s "-32601"] `shouldBe` MethodNotFound "tickets" "nosuch"
     typed ["message" .= s "Activation not found: nosuch", "code" .= s "-32601"] `shouldBe` ActivationNotFound "nosuch"
     typed ["message" .= s "Method not found: tickets.inputs.nosuch", "code" .= s "-32601"] `shouldBe` MethodNotFound "tickets.inputs" "nosuch"
+    -- as plexus-client's spec05.rs reads it: no dot, the method alone
+    typed ["message" .= s "Method not found: nosuch", "code" .= s "-32601"] `shouldBe` MethodNotFound "" "nosuch"
     itemRefusal (either error id (decodes @PlexusStreamItem (frame
       [ "message" .= s "needs x", "error_kind" .= s "forbidden", "grant" .= s "tickets.get", "scope" .= s "*" ])))
       `shouldSatisfy` maybe False ((== Just "tickets.get") . refusalGrant)
