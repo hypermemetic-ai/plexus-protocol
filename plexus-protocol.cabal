@@ -22,7 +22,6 @@ library
     Plexus.Client
     Plexus.Client.Pool
     Plexus.Input
-    Plexus.NeedsInput
     Plexus.Transport
     Plexus
     Plexus.Types

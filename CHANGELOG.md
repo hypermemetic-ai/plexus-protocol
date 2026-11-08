@@ -2,7 +2,7 @@
 
 ## 0.7.0.0
 
-Asking without bidir (ASK-1, ASK-3). Breaking.
+bidir removed (ASK-1, ASK-3). Breaking.
 
 ### Breaking
 
@@ -13,18 +13,10 @@ Asking without bidir (ASK-1, ASK-3). Breaking.
   `StandardRequest` / `StandardResponse` and `sendBidirectionalResponse`
   (`{ns}.respond`) are removed. A `request` item is no stream item.
 - **`MethodSchema`**: `methodBidirectional`, `methodRequestType` and
-  `methodResponseType` give way to `methodAsks` (`asks`, written only when
-  true). An older schema's `bidirectional` (and its request / response
-  types) is read past, as `asks: false`.
-
-### Added
-
-- **`Plexus.NeedsInput`.** A method that asks finishes its call with a data
-  item whose content is `{"type":"needs_input","summary","effects","fields",
-  "token","expires"}`: `NeedsInput`, `NeedsInputField` (`name`, `options`?,
-  `default`?, `help`?), `ConfirmToken`, `needsInputOf` /
-  `needsInputOfContent`, and `answerParams` — the same params, each field's
-  value under its own name, and `confirm`. The input half (BIDIR-18,
+  `methodResponseType` are removed, with nothing in their place. An older
+  schema's `bidirectional` (and its request / response types) is read past.
+- Plexus has no in-call or protocol-wide confirmation: a service that wants
+  one builds it as its own methods. The input half (BIDIR-18,
   `Plexus.Input`) stays.
 
 ## 0.6.0.0

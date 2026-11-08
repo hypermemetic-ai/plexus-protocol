@@ -246,7 +246,6 @@ data MethodSchema = MethodSchema
   , methodError           :: Maybe Value  -- ^ JSON Schema for the error type @E@ (@-> Result<T, E>@); 'Nothing' when the method is infallible
   , methodProgress        :: Maybe Value  -- ^ JSON Schema for the progress type @P@ carried by progress frames; 'Nothing' when the method reports no progress
   , methodCardinality     :: Cardinality  -- ^ One item or many
-  , methodAsks            :: Bool         -- ^ ASK-1: the method may finish a call with a proposal (@needs_input@) and takes @confirm@; an older schema's @bidirectional@ reads as 'False'
   , methodHttpMethod      :: Text         -- ^ HTTP method of the method's REST endpoint (@"GET"@, @"POST"@, …); @"POST"@ when absent
   , methodDeprecation     :: Maybe DeprecationInfo  -- ^ Deprecation info, if any (IR-5)
   , methodParamSchemas    :: Maybe [ParamSchema]    -- ^ Optional structured param info with per-field deprecations (IR-5)
@@ -273,10 +272,8 @@ instance FromJSON MethodSchema where
     <*> o .:? "error"
     <*> o .:? "progress"
     <*> cardinalityOf o
-    -- ASK-1: @asks@; an older schema's @bidirectional@, @request_type@
-    -- and @response_type@ are read past (a bidirectional method asks nothing
-    -- this client can answer)
-    <*> o .:? "asks"           .!= False
+    -- ASK-1: bidir is gone; an older schema's @bidirectional@,
+    -- @request_type@ and @response_type@ are read past
     <*> o .:? "http_method"    .!= "POST"
     <*> o .:? "deprecation"
     <*> o .:? "param_schemas"
@@ -326,7 +323,6 @@ instance ToJSON MethodSchema where
     [ "params"         .=? methodParams
     , "error"          .=? methodError
     , "progress"       .=? methodProgress
-    , if methodAsks then Just ("asks" .= True) else Nothing
     , "deprecation"    .=? methodDeprecation
     , "param_schemas"  .=? methodParamSchemas
     , "long_description" .=? methodLongDescription

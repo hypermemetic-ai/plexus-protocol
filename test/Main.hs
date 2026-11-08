@@ -36,7 +36,6 @@ import Plexus.Auth (Refusal (..), View (..))
 import Plexus.RemoteError
 import Plexus.Schema.Recursive
 import Plexus.Types hiding (GuidanceErrorType (..))
-import Plexus.NeedsInput
 
 -- ============================================================================
 -- The fixture
@@ -102,8 +101,9 @@ matches (Object e) (Object a) =
 matches (Array e) (Array a) = length e == length a && and (zipWith matches (toList e) (toList a))
 matches e a = e == a
 
--- | ASK-1: a schema written before @asks@ says @"bidirectional": false@ on
--- every method; it reads as @asks: false@, which is written as nothing.
+-- | ASK-1: a schema written before bidir's removal says
+-- @"bidirectional": false@ on every method; it is read past and written as
+-- nothing.
 dropBidirectional :: Value -> Value
 dropBidirectional = \case
   Object o -> Object (KM.map dropBidirectional (KM.filterWithKey (\k v -> not (k == "bidirectional" && v == Bool False)) o))
@@ -164,11 +164,11 @@ spec = do
   rejectionSpec
   strictnessSpec
   mergedSpec
-  askSpec
+  noBidirSpec
 
 schemaSpec :: Spec
 schemaSpec = describe "expected/schema.json" $ do
-  -- ASK-1: a fixture written before asks says bidirectional: false
+  -- ASK-1: a fixture written before bidir's removal says bidirectional: false
   let load = dropBidirectional <$> readJson (fixtureDir </> "schema.json")
 
   it "parses as a PluginSchema and re-encodes to the same JSON" $ do
@@ -239,7 +239,6 @@ schemaSpec = describe "expected/schema.json" $ do
     forM_ (psMethods schema) $ \m -> do
       methodHttpMethod m `shouldBe` "POST"
       methodRole m `shouldBe` MethodRoleRpc
-      methodAsks m `shouldBe` False
 
 wireSpec :: Spec
 wireSpec = describe "expected/wire/*.jsonl" $ do
@@ -733,30 +732,21 @@ mergedSpec = describe "0.7 merged with main's auth (RETURNS-36)" $ do
     psHash p `shouldBe` ""
     psView p `shouldBe` Just Anonymous
 
--- | ASK-1: a method that asks finishes its call with a proposal; bidir's
--- request item, its types and @{ns}.respond@ are gone from the wire.
-askSpec :: Spec
-askSpec = describe "asking (ASK-1)" $ do
+-- | ASK-1: bidir is gone from the wire, and nothing replaced it: an older
+-- schema's bidirectional keys are read past, and a request item is no stream
+-- item.
+noBidirSpec :: Spec
+noBidirSpec = describe "no bidir (ASK-1)" $ do
   let method extra = object $
         [ "name" .= s "archive", "description" .= s "d", "hash" .= s "h"
         , "returns" .= object [], "cardinality" .= s "one" ] ++ extra
       meta = "metadata" .= object
         ["provenance" .= [s "tickets"], "plexus_hash" .= s "h", "timestamp" .= (0 :: Int)]
-      proposal = object
-        [ "type" .= s "needs_input", "summary" .= s "archive MENGER-4, MENGER-5"
-        , "effects" .= [s "MENGER-4", s "MENGER-5"]
-        , "fields" .= [object ["name" .= s "children", "options" .= [s "reparent", s "delete"], "default" .= s "reparent", "help" .= s "what moves"]]
-        , "token" .= s "v1.1794100000.abc", "expires" .= s "2026-11-07T12:00:00Z" ]
 
-  it "a method that asks says asks: true, and is written so" $ do
-    m <- roundTrips @MethodSchema id (method ["asks" .= True, "http_method" .= s "POST", "role" .= object ["kind" .= s "rpc"]])
-    methodAsks m `shouldBe` True
-
-  it "an older schema's bidirectional (and its request/response types) reads as asks: false" $ do
+  it "an older schema's bidirectional (and its request/response types) is read past" $ do
     m <- either fail pure $ decodes @MethodSchema (method
       [ "bidirectional" .= True, "request_type" .= object ["title" .= s "StandardRequest"]
       , "response_type" .= object ["title" .= s "StandardResponse"] ])
-    methodAsks m `shouldBe` False
     toJSON m `shouldBe` method ["http_method" .= s "POST", "role" .= object ["kind" .= s "rpc"]]
 
   it "a request item (spec/08's, gone) is no stream item" $
@@ -765,29 +755,10 @@ askSpec = describe "asking (ASK-1)" $ do
       , "request" .= object ["type" .= s "confirm", "message" .= s "ok?"] ]))
       `shouldSatisfy` either (const True) (const False)
 
-  it "a data item whose content is needs_input is a proposal" $ do
+  it "a data item whose content says needs_input is an ordinary data item" $ do
+    let content = object ["type" .= s "needs_input", "summary" .= s "go", "token" .= s "t"]
     item <- roundTrips @PlexusStreamItem normalizeFrame (object
-      [ "type" .= s "data", meta, "content_type" .= s "tickets.archive", "content" .= proposal ])
-    ni <- maybe (fail "no proposal") pure (needsInputOf item)
-    niSummary ni `shouldBe` "archive MENGER-4, MENGER-5"
-    niToken ni `shouldBe` "v1.1794100000.abc"
-    niExpires ni `shouldBe` Just "2026-11-07T12:00:00Z"
-    map nifName (niFields ni) `shouldBe` ["children"]
-    map nifOptions (niFields ni) `shouldBe` [Just [String "reparent", String "delete"]]
-    map nifDefault (niFields ni) `shouldBe` [Just (String "reparent")]
-    toJSON ni `shouldBe` proposal
-
-  it "a confirmation is a proposal with no fields; effects and fields may be left out" $ do
-    ni <- maybe (fail "no proposal") pure (needsInputOfContent (object ["type" .= s "needs_input", "summary" .= s "go", "token" .= s "t"]))
-    niFields ni `shouldBe` []
-    niEffects ni `shouldBe` []
-
-  it "any other data item is no proposal" $ do
-    needsInputOfContent (object ["type" .= s "archived", "id" .= s "MENGER-4"]) `shouldBe` Nothing
-    needsInputOfContent (object ["type" .= s "needs_input"]) `shouldBe` Nothing
-    needsInputOfContent (String "needs_input") `shouldBe` Nothing
-
-  it "the answer is the same params, each field under its name, and confirm" $ do
-    answerParams (object ["ids" .= [s "KILN-2"]]) [("children", String "reparent")] "tok"
-      `shouldBe` object ["ids" .= [s "KILN-2"], "children" .= s "reparent", "confirm" .= s "tok"]
-    answerParams Null [] "tok" `shouldBe` object ["confirm" .= s "tok"]
+      [ "type" .= s "data", meta, "content_type" .= s "tickets.archive", "content" .= content ])
+    case item of
+      StreamData _ _ _ c -> c `shouldBe` content
+      other -> expectationFailure ("not a data item: " <> show other)
