@@ -30,6 +30,10 @@
 -- * 'StreamError' - The call failed, typed as a 'RemoteError' (may be recoverable)
 -- * 'StreamDone' - Stream completed successfully
 --
+-- A method that asks (its schema's @asks@) may finish a call with a data
+-- item whose content is a proposal ('needsInputOf'); the caller answers it
+-- by calling the same method again ('answerParams').
+--
 module Plexus
   ( -- * Connection (re-exported from Plexus.Client)
     SubstrateConnection
@@ -54,13 +58,12 @@ module Plexus
   , rpcCallStreaming
   , invokeMethodStreaming
 
-    -- * Bidirectional Response
-  , sendBidirectionalResponse
-
-    -- * Bidirectional Types
-  , StandardRequest(..)
-  , StandardResponse(..)
-  , SelectOption(..)
+    -- * Asking (ASK-1): a proposal, and the call that answers it
+  , NeedsInput(..)
+  , NeedsInputField(..)
+  , ConfirmToken
+  , needsInputOf
+  , answerParams
 
     -- * Stream Types
   , PlexusStreamItem(..)
@@ -93,3 +96,4 @@ import Plexus.RemoteError
 import Plexus.Schema.Recursive
 import Plexus.Client
 import Plexus.Transport
+import Plexus.NeedsInput

@@ -22,15 +22,6 @@ module Plexus.Types
   , GuidanceSuggestion(..)
   , TransportError(..)
 
-    -- * Bidirectional Types
-  , SelectOption(..)
-  , Request(..)
-  , Response(..)
-  , WellKnownRequest
-  , WellKnownResponse
-  , StandardRequest  -- Deprecated, kept for backwards compatibility
-  , StandardResponse -- Deprecated, kept for backwards compatibility
-
     -- * Helpers
   , mkSubscribeRequest
   , mkUnsubscribeRequest
@@ -369,125 +360,6 @@ instance FromJSON TransportError where
       _ -> fail $ "Unknown transport error_kind: " <> T.unpack kind
 
 -- ============================================================================
--- Bidirectional Types (Request/Response)
--- ============================================================================
-
--- | Option for select requests, parameterized over value type
-data SelectOption t = SelectOption
-  { optionValue       :: t
-  , optionLabel       :: Text
-  , optionDescription :: Maybe Text
-  }
-  deriving (Show, Eq, Generic)
-
-instance (FromJSON t) => FromJSON (SelectOption t) where
-  parseJSON = withObject "SelectOption" $ \o -> SelectOption
-    <$> o .: "value"
-    <*> o .: "label"
-    <*> o .:? "description"
-
-instance (ToJSON t) => ToJSON (SelectOption t) where
-  toJSON SelectOption{..} = object $
-    [ "value" .= optionValue, "label" .= optionLabel ]
-    <> catMaybes [("description" .=) <$> optionDescription]
-
--- | Parameterized request type for bidirectional communication
---
--- This type represents the well-known request types in the Plexus bidirectional protocol.
--- Unlike Rust which uses traits, Haskell uses a parameterized ADT which provides
--- similar flexibility with better type safety.
---
--- The type parameter @t@ is used for values in Prompt defaults and Select options.
--- For most cases, use 'WellKnownRequest' which sets @t = Value@.
-data Request t
-  = Confirm  { confirmMessage :: Text, confirmDefault :: Maybe Bool }
-  | Prompt   { promptMessage :: Text, promptDefault :: Maybe t, promptPlaceholder :: Maybe Text }
-  | Select   { selectMessage :: Text, selectOptions :: [SelectOption t], selectMulti :: Bool }
-  deriving (Show, Eq, Generic)
-
--- | Well-known request types with JSON values
---
--- This is the recommended type for most bidirectional requests.
--- It matches the Rust @WellKnownRequest@ and TypeScript union types.
-type WellKnownRequest = Request Value
-
--- | Type alias for backwards compatibility: requests with JSON values
---
--- Deprecated: Use 'WellKnownRequest' instead for consistency with Rust/TypeScript.
-type StandardRequest = Request Value
-
-instance (FromJSON t) => FromJSON (Request t) where
-  parseJSON = withObject "Request" $ \o -> do
-    typ <- o .: "type" :: Parser Text
-    case typ of
-      "confirm" -> Confirm
-        <$> o .: "message"
-        <*> o .:? "default"
-      "prompt" -> Prompt
-        <$> o .: "message"
-        <*> o .:? "default"
-        <*> o .:? "placeholder"
-      "select" -> Select
-        <$> o .: "message"
-        <*> o .: "options"
-        <*> o .:? "multi_select" .!= False
-      _ -> fail $ "Unknown request type: " <> T.unpack typ
-
-instance (ToJSON t) => ToJSON (Request t) where
-  toJSON (Confirm msg def) = object $
-    [ "type" .= ("confirm" :: Text), "message" .= msg ]
-    <> catMaybes [("default" .=) <$> def]
-  toJSON (Prompt msg def placeholder) = object $
-    [ "type" .= ("prompt" :: Text), "message" .= msg ]
-    <> catMaybes [("default" .=) <$> def, ("placeholder" .=) <$> placeholder]
-  toJSON (Select msg opts multi) = object
-    [ "type" .= ("select" :: Text), "message" .= msg
-    , "options" .= opts, "multi_select" .= multi ]
-
--- | Parameterized response type for bidirectional communication
---
--- This type represents the well-known response types in the Plexus bidirectional protocol.
---
--- Note: The 'Value' constructor corresponds to JSON @"type":"text"@ for
--- wire compatibility with the Rust implementation.
---
--- The type parameter @t@ is used for values in Prompt responses and Select responses.
--- For most cases, use 'WellKnownResponse' which sets @t = Value@.
-data Response t
-  = Confirmed { confirmedValue :: Bool }
-  | Value     { responseValue :: t }    -- ^ wire tag: "text"
-  | Selected  { selectedValues :: [t] }
-  | Cancelled
-  deriving (Show, Eq, Generic)
-
--- | Well-known response types with JSON values
---
--- This is the recommended type for most bidirectional responses.
--- It matches the Rust @WellKnownResponse@ and TypeScript union types.
-type WellKnownResponse = Response Value
-
--- | Type alias for backwards compatibility: responses with JSON values
---
--- Deprecated: Use 'WellKnownResponse' instead for consistency with Rust/TypeScript.
-type StandardResponse = Response Value
-
-instance (FromJSON t) => FromJSON (Response t) where
-  parseJSON = withObject "Response" $ \o -> do
-    typ <- o .: "type" :: Parser Text
-    case typ of
-      "confirmed" -> Confirmed <$> o .: "value"
-      "text"      -> Value <$> o .: "value"
-      "selected"  -> Selected <$> o .: "values"
-      "cancelled" -> pure Cancelled
-      _ -> fail $ "Unknown response type: " <> T.unpack typ
-
-instance (ToJSON t) => ToJSON (Response t) where
-  toJSON (Confirmed v)  = object ["type" .= ("confirmed" :: Text), "value" .= v]
-  toJSON (Value v)      = object ["type" .= ("text" :: Text), "value" .= v]
-  toJSON (Selected vs)  = object ["type" .= ("selected" :: Text), "values" .= vs]
-  toJSON Cancelled      = object ["type" .= ("cancelled" :: Text)]
-
--- ============================================================================
 -- Plexus Stream Items
 -- ============================================================================
 
@@ -545,13 +417,6 @@ data PlexusStreamItem
         -- the refusal's fields), kept as sent and written back so; empty
         -- for a frame built here.
       }
-  | StreamRequest
-      { itemPlexusHash  :: Text
-      , itemProvenance  :: Provenance
-      , itemRequestId   :: Text
-      , itemRequestData :: StandardRequest
-      , itemTimeout     :: Maybe Int
-      }
   | StreamDone
       { itemPlexusHash :: Text
       , itemProvenance :: Provenance
@@ -565,7 +430,7 @@ pattern StreamError :: Text -> Provenance -> RemoteError -> Bool -> PlexusStream
 pattern StreamError hash prov err rec <- StreamErrorWith hash prov err rec _ _
   where StreamError hash prov err rec = StreamErrorWith hash prov err rec Nothing KM.empty
 
-{-# COMPLETE StreamProgress, StreamData, StreamGuidance, StreamError, StreamRequest, StreamDone #-}
+{-# COMPLETE StreamProgress, StreamData, StreamGuidance, StreamError, StreamDone #-}
 
 -- | AUTH-2: the refusal an item carries — an error item with
 -- @error_kind: "forbidden"@ (or whose typed error is a
@@ -610,10 +475,6 @@ instance FromJSON PlexusStreamItem where
             <*> o .: "recoverable"
             <*> pure (refusalFromObject o)
             <*> pure (besideError o)
-          "request" -> StreamRequest hash prov
-            <$> o .: "request_id"
-            <*> o .: "request"
-            <*> o .:? "timeout"
           "done" -> pure $ StreamDone hash prov
           _ -> fail $ "Unknown event type: " <> T.unpack typ
 
@@ -644,11 +505,6 @@ instance FromJSON PlexusStreamItem where
             <*> o .:? "recoverable" .!= False
             <*> pure (refusalFromObject o)
             <*> pure (besideError o)
-          "request" -> StreamRequest hash
-            <$> o .: "provenance"
-            <*> o .: "request_id"
-            <*> o .: "request"
-            <*> o .:? "timeout"
           "done" -> StreamDone hash
             <$> o .: "provenance"
           _ -> fail $ "Unknown event type: " <> T.unpack typ
@@ -687,14 +543,6 @@ instance ToJSON PlexusStreamItem where
       refusalFields = case toJSON <$> refusal of
         Just (Object ro) -> [ (k, v) | (k, v) <- KM.toList ro, k /= "message" ]
         _ -> []
-  toJSON (StreamRequest hash prov reqId reqData timeout) = object $
-    [ "type" .= ("request" :: Text)
-    , "metadata" .= StreamMetadata prov hash 0
-    , "request_id" .= reqId
-    , "request" .= reqData
-    ] <> catMaybes
-    [ ("timeout" .=) <$> timeout
-    ]
   toJSON (StreamDone hash prov) = object
     [ "type" .= ("done" :: Text)
     , "metadata" .= StreamMetadata prov hash 0

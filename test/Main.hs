@@ -1,4 +1,4 @@
--- | plexus-protocol 0.6 against plexus 0.7.
+-- | plexus-protocol 0.7 against plexus 0.7 and 0.8.
 --
 -- The golden half reads RETURNS-7's conformance fixture by sibling path
 -- (@../plexus-macros/fixtures/conformance/expected/@) and checks that every
@@ -36,6 +36,7 @@ import Plexus.Auth (Refusal (..), View (..))
 import Plexus.RemoteError
 import Plexus.Schema.Recursive
 import Plexus.Types hiding (GuidanceErrorType (..))
+import Plexus.NeedsInput
 
 -- ============================================================================
 -- The fixture
@@ -101,6 +102,14 @@ matches (Object e) (Object a) =
 matches (Array e) (Array a) = length e == length a && and (zipWith matches (toList e) (toList a))
 matches e a = e == a
 
+-- | ASK-1: a schema written before @asks@ says @"bidirectional": false@ on
+-- every method; it reads as @asks: false@, which is written as nothing.
+dropBidirectional :: Value -> Value
+dropBidirectional = \case
+  Object o -> Object (KM.map dropBidirectional (KM.filterWithKey (\k v -> not (k == "bidirectional" && v == Bool False)) o))
+  Array a -> Array (fmap dropBidirectional a)
+  v -> v
+
 -- | Parse @v@ as an @a@, re-encode it, and require the result to match @v@.
 roundTrips :: forall a. (FromJSON a, ToJSON a) => (Value -> Value) -> Value -> IO a
 roundTrips norm v = case parseEither parseJSON v of
@@ -155,10 +164,12 @@ spec = do
   rejectionSpec
   strictnessSpec
   mergedSpec
+  askSpec
 
 schemaSpec :: Spec
 schemaSpec = describe "expected/schema.json" $ do
-  let load = readJson (fixtureDir </> "schema.json")
+  -- ASK-1: a fixture written before asks says bidirectional: false
+  let load = dropBidirectional <$> readJson (fixtureDir </> "schema.json")
 
   it "parses as a PluginSchema and re-encodes to the same JSON" $ do
     v <- load
@@ -228,7 +239,7 @@ schemaSpec = describe "expected/schema.json" $ do
     forM_ (psMethods schema) $ \m -> do
       methodHttpMethod m `shouldBe` "POST"
       methodRole m `shouldBe` MethodRoleRpc
-      methodBidirectional m `shouldBe` False
+      methodAsks m `shouldBe` False
 
 wireSpec :: Spec
 wireSpec = describe "expected/wire/*.jsonl" $ do
@@ -499,7 +510,7 @@ strictnessSpec = describe "0.7 shapes are required, not defaulted" $ do
     methodHttpMethod m `shouldBe` "POST"
     methodRole m `shouldBe` MethodRoleRpc
     toJSON m `shouldBe` method
-      [ returns, "cardinality" .= s "many", "bidirectional" .= False
+      [ returns, "cardinality" .= s "many"
       , "http_method" .= s "POST", "role" .= object ["kind" .= s "rpc"] ]
 
   let meta = "metadata" .= object
@@ -518,7 +529,7 @@ strictnessSpec = describe "0.7 shapes are required, not defaulted" $ do
     methodReturns one `shouldBe` object ["type" .= s "string"]
     -- written back in 0.8's shape
     toJSON many `shouldBe` method
-      [ returns, "cardinality" .= s "many", "bidirectional" .= False
+      [ returns, "cardinality" .= s "many"
       , "http_method" .= s "POST", "role" .= object ["kind" .= s "rpc"] ]
 
   it "a 0.8 method's cardinality wins over a streaming flag beside it" $ do
@@ -695,7 +706,7 @@ mergedSpec = describe "0.7 merged with main's auth (RETURNS-36)" $ do
     let wire = object
           [ "name" .= s "set_status", "description" .= s "d", "hash" .= s "h"
           , "returns" .= object [], "error" .= object ["title" .= s "SetStatusError"]
-          , "cardinality" .= s "one", "bidirectional" .= False, "http_method" .= s "POST"
+          , "cardinality" .= s "one", "http_method" .= s "POST"
           , "role" .= object ["kind" .= s "rpc"]
           , "long_description" .= s "long", "grant" .= s "tickets.set_status", "target" .= s "id"
           , "held_on" .= [s "*"], "public" .= True, "group" .= s "write"
@@ -721,3 +732,62 @@ mergedSpec = describe "0.7 merged with main's auth (RETURNS-36)" $ do
       (object ["namespace" .= s "menger", "methods" .= ([] :: [Value]), "view" .= s "anonymous"])
     psHash p `shouldBe` ""
     psView p `shouldBe` Just Anonymous
+
+-- | ASK-1: a method that asks finishes its call with a proposal; bidir's
+-- request item, its types and @{ns}.respond@ are gone from the wire.
+askSpec :: Spec
+askSpec = describe "asking (ASK-1)" $ do
+  let method extra = object $
+        [ "name" .= s "archive", "description" .= s "d", "hash" .= s "h"
+        , "returns" .= object [], "cardinality" .= s "one" ] ++ extra
+      meta = "metadata" .= object
+        ["provenance" .= [s "tickets"], "plexus_hash" .= s "h", "timestamp" .= (0 :: Int)]
+      proposal = object
+        [ "type" .= s "needs_input", "summary" .= s "archive MENGER-4, MENGER-5"
+        , "effects" .= [s "MENGER-4", s "MENGER-5"]
+        , "fields" .= [object ["name" .= s "children", "options" .= [s "reparent", s "delete"], "default" .= s "reparent", "help" .= s "what moves"]]
+        , "token" .= s "v1.1794100000.abc", "expires" .= s "2026-11-07T12:00:00Z" ]
+
+  it "a method that asks says asks: true, and is written so" $ do
+    m <- roundTrips @MethodSchema id (method ["asks" .= True, "http_method" .= s "POST", "role" .= object ["kind" .= s "rpc"]])
+    methodAsks m `shouldBe` True
+
+  it "an older schema's bidirectional (and its request/response types) reads as asks: false" $ do
+    m <- either fail pure $ decodes @MethodSchema (method
+      [ "bidirectional" .= True, "request_type" .= object ["title" .= s "StandardRequest"]
+      , "response_type" .= object ["title" .= s "StandardResponse"] ])
+    methodAsks m `shouldBe` False
+    toJSON m `shouldBe` method ["http_method" .= s "POST", "role" .= object ["kind" .= s "rpc"]]
+
+  it "a request item (spec/08's, gone) is no stream item" $
+    (decodes @PlexusStreamItem (object
+      [ "type" .= s "request", meta, "request_id" .= s "r1"
+      , "request" .= object ["type" .= s "confirm", "message" .= s "ok?"] ]))
+      `shouldSatisfy` either (const True) (const False)
+
+  it "a data item whose content is needs_input is a proposal" $ do
+    item <- roundTrips @PlexusStreamItem normalizeFrame (object
+      [ "type" .= s "data", meta, "content_type" .= s "tickets.archive", "content" .= proposal ])
+    ni <- maybe (fail "no proposal") pure (needsInputOf item)
+    niSummary ni `shouldBe` "archive MENGER-4, MENGER-5"
+    niToken ni `shouldBe` "v1.1794100000.abc"
+    niExpires ni `shouldBe` Just "2026-11-07T12:00:00Z"
+    map nifName (niFields ni) `shouldBe` ["children"]
+    map nifOptions (niFields ni) `shouldBe` [Just [String "reparent", String "delete"]]
+    map nifDefault (niFields ni) `shouldBe` [Just (String "reparent")]
+    toJSON ni `shouldBe` proposal
+
+  it "a confirmation is a proposal with no fields; effects and fields may be left out" $ do
+    ni <- maybe (fail "no proposal") pure (needsInputOfContent (object ["type" .= s "needs_input", "summary" .= s "go", "token" .= s "t"]))
+    niFields ni `shouldBe` []
+    niEffects ni `shouldBe` []
+
+  it "any other data item is no proposal" $ do
+    needsInputOfContent (object ["type" .= s "archived", "id" .= s "MENGER-4"]) `shouldBe` Nothing
+    needsInputOfContent (object ["type" .= s "needs_input"]) `shouldBe` Nothing
+    needsInputOfContent (String "needs_input") `shouldBe` Nothing
+
+  it "the answer is the same params, each field under its name, and confirm" $ do
+    answerParams (object ["ids" .= [s "KILN-2"]]) [("children", String "reparent")] "tok"
+      `shouldBe` object ["ids" .= [s "KILN-2"], "children" .= s "reparent", "confirm" .= s "tok"]
+    answerParams Null [] "tok" `shouldBe` object ["confirm" .= s "tok"]
