@@ -16,6 +16,8 @@ module Plexus.Transport
 
     -- * Schema Fetching
   , fetchSchemaAt
+  , fetchSchemaAtIfAny
+  , schemaNotFound
   , fetchMethodSchemaAt
   , extractSchema
   , extractSchemaResult
@@ -47,7 +49,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import Plexus.Client (SubstrateConfig(..), LostConnection(..), connect, disconnect, substrateRpc, substrateRpcDuplex, defaultConfig)
 import Plexus.Input (InputHalf)
 import Plexus.Client.Pool (ConnectionPool, createConnectionPool, withPooledConnection, defaultPlexusPoolConfig)
-import Plexus.RemoteError (renderRemoteError)
+import Plexus.RemoteError (RemoteError(..), renderRemoteError)
 import Plexus.Types (PlexusStreamItem(..), TransportError(..))
 import Plexus.Schema.Recursive (PluginSchema, MethodSchema, SchemaResult(..), parsePluginSchema, parseSchemaResult)
 
@@ -235,6 +237,38 @@ fetchSchemaAt cfg path = do
     Right items -> case extractSchema items of
       Left parseErr -> pure $ Left $ ProtocolError parseErr  -- Parse errors are protocol errors
       Right schema -> pure $ Right schema
+
+-- | NEST-5 / NEST-7: the schema at a path that may not be there — a name
+--   in a slot (a dynamic child's key, a peer's name). @Right Nothing@ when
+--   the service says there is nothing at the path (activation or method not
+--   found, as a call failure or a JSON-RPC @-32601@; a slot's own
+--   @not_found@, as plexus-core's @PeerError::NotFound@); every other failure
+--   (the connection, a refusal, an unreadable answer) is @Left@, as
+--   'fetchSchemaAt' says it.
+fetchSchemaAtIfAny :: SubstrateConfig -> [Text] -> IO (Either TransportError (Maybe PluginSchema))
+fetchSchemaAtIfAny cfg path = do
+  let backend = substrateBackend cfg
+  let schemaMethod = if null path
+        then backend <> ".schema"
+        else T.intercalate "." path <> ".schema"
+  result <- rpcCallWith cfg (backend <> ".call") (object ["method" .= schemaMethod])
+  pure $ case result of
+    Left transportErr -> Left transportErr
+    Right items
+      | schemaNotFound items -> Right Nothing
+      | otherwise -> either (Left . ProtocolError) (Right . Just) (extractSchema items)
+
+-- | Whether a schema call's items say there is nothing at its path: no
+--   schema, and the first failure is activation or method not found, or
+--   a slot's @not_found@.
+schemaNotFound :: [PlexusStreamItem] -> Bool
+schemaNotFound items =
+  null [() | StreamData _ _ ct _ <- items, ".schema" `T.isSuffixOf` ct]
+    && case [err | StreamError _ _ err _ <- items] of
+         (ActivationNotFound _ : _) -> True
+         (MethodNotFound _ _ : _)   -> True
+         (Other "not_found" _ : _)  -> True
+         _                          -> False
 
 -- | Extract PluginSchema from stream items
 -- Returns Either Text for application-level errors (not transport)
