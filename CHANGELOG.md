@@ -1,5 +1,24 @@
 # Changelog for plexus-protocol
 
+## 0.7.0.0
+
+bidir removed (ASK-1, ASK-3). Breaking.
+
+### Breaking
+
+- **bidir is gone.** The server no longer asks its caller mid-call: the
+  `request` stream item (`StreamRequest`), `Request` / `Response`
+  (`Confirm`, `Prompt`, `Select`; `Confirmed`, `Value`, `Selected`,
+  `Cancelled`), `SelectOption`, `WellKnownRequest` / `WellKnownResponse`,
+  `StandardRequest` / `StandardResponse` and `sendBidirectionalResponse`
+  (`{ns}.respond`) are removed. A `request` item is no stream item.
+- **`MethodSchema`**: `methodBidirectional`, `methodRequestType` and
+  `methodResponseType` are removed, with nothing in their place. An older
+  schema's `bidirectional` (and its request / response types) is read past.
+- Plexus has no in-call or protocol-wide confirmation: a service that wants
+  one builds it as its own methods. The input half (BIDIR-18,
+  `Plexus.Input`) stays.
+
 ## 0.6.0.0
 
 The Haskell side of plexus 0.7's schema and envelope. Breaking.

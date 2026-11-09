@@ -1,4 +1,4 @@
--- | plexus-protocol 0.6 against plexus 0.7.
+-- | plexus-protocol 0.7 against plexus 0.7 and 0.8.
 --
 -- The golden half reads RETURNS-7's conformance fixture by sibling path
 -- (@../plexus-macros/fixtures/conformance/expected/@) and checks that every
@@ -101,6 +101,15 @@ matches (Object e) (Object a) =
 matches (Array e) (Array a) = length e == length a && and (zipWith matches (toList e) (toList a))
 matches e a = e == a
 
+-- | ASK-1: a schema written before bidir's removal says
+-- @"bidirectional": false@ on every method; it is read past and written as
+-- nothing.
+dropBidirectional :: Value -> Value
+dropBidirectional = \case
+  Object o -> Object (KM.map dropBidirectional (KM.filterWithKey (\k v -> not (k == "bidirectional" && v == Bool False)) o))
+  Array a -> Array (fmap dropBidirectional a)
+  v -> v
+
 -- | Parse @v@ as an @a@, re-encode it, and require the result to match @v@.
 roundTrips :: forall a. (FromJSON a, ToJSON a) => (Value -> Value) -> Value -> IO a
 roundTrips norm v = case parseEither parseJSON v of
@@ -155,10 +164,12 @@ spec = do
   rejectionSpec
   strictnessSpec
   mergedSpec
+  noBidirSpec
 
 schemaSpec :: Spec
 schemaSpec = describe "expected/schema.json" $ do
-  let load = readJson (fixtureDir </> "schema.json")
+  -- ASK-1: a fixture written before bidir's removal says bidirectional: false
+  let load = dropBidirectional <$> readJson (fixtureDir </> "schema.json")
 
   it "parses as a PluginSchema and re-encodes to the same JSON" $ do
     v <- load
@@ -228,7 +239,6 @@ schemaSpec = describe "expected/schema.json" $ do
     forM_ (psMethods schema) $ \m -> do
       methodHttpMethod m `shouldBe` "POST"
       methodRole m `shouldBe` MethodRoleRpc
-      methodBidirectional m `shouldBe` False
 
 wireSpec :: Spec
 wireSpec = describe "expected/wire/*.jsonl" $ do
@@ -499,7 +509,7 @@ strictnessSpec = describe "0.7 shapes are required, not defaulted" $ do
     methodHttpMethod m `shouldBe` "POST"
     methodRole m `shouldBe` MethodRoleRpc
     toJSON m `shouldBe` method
-      [ returns, "cardinality" .= s "many", "bidirectional" .= False
+      [ returns, "cardinality" .= s "many"
       , "http_method" .= s "POST", "role" .= object ["kind" .= s "rpc"] ]
 
   let meta = "metadata" .= object
@@ -518,7 +528,7 @@ strictnessSpec = describe "0.7 shapes are required, not defaulted" $ do
     methodReturns one `shouldBe` object ["type" .= s "string"]
     -- written back in 0.8's shape
     toJSON many `shouldBe` method
-      [ returns, "cardinality" .= s "many", "bidirectional" .= False
+      [ returns, "cardinality" .= s "many"
       , "http_method" .= s "POST", "role" .= object ["kind" .= s "rpc"] ]
 
   it "a 0.8 method's cardinality wins over a streaming flag beside it" $ do
@@ -695,7 +705,7 @@ mergedSpec = describe "0.7 merged with main's auth (RETURNS-36)" $ do
     let wire = object
           [ "name" .= s "set_status", "description" .= s "d", "hash" .= s "h"
           , "returns" .= object [], "error" .= object ["title" .= s "SetStatusError"]
-          , "cardinality" .= s "one", "bidirectional" .= False, "http_method" .= s "POST"
+          , "cardinality" .= s "one", "http_method" .= s "POST"
           , "role" .= object ["kind" .= s "rpc"]
           , "long_description" .= s "long", "grant" .= s "tickets.set_status", "target" .= s "id"
           , "held_on" .= [s "*"], "public" .= True, "group" .= s "write"
@@ -721,3 +731,34 @@ mergedSpec = describe "0.7 merged with main's auth (RETURNS-36)" $ do
       (object ["namespace" .= s "menger", "methods" .= ([] :: [Value]), "view" .= s "anonymous"])
     psHash p `shouldBe` ""
     psView p `shouldBe` Just Anonymous
+
+-- | ASK-1: bidir is gone from the wire, and nothing replaced it: an older
+-- schema's bidirectional keys are read past, and a request item is no stream
+-- item.
+noBidirSpec :: Spec
+noBidirSpec = describe "no bidir (ASK-1)" $ do
+  let method extra = object $
+        [ "name" .= s "archive", "description" .= s "d", "hash" .= s "h"
+        , "returns" .= object [], "cardinality" .= s "one" ] ++ extra
+      meta = "metadata" .= object
+        ["provenance" .= [s "tickets"], "plexus_hash" .= s "h", "timestamp" .= (0 :: Int)]
+
+  it "an older schema's bidirectional (and its request/response types) is read past" $ do
+    m <- either fail pure $ decodes @MethodSchema (method
+      [ "bidirectional" .= True, "request_type" .= object ["title" .= s "StandardRequest"]
+      , "response_type" .= object ["title" .= s "StandardResponse"] ])
+    toJSON m `shouldBe` method ["http_method" .= s "POST", "role" .= object ["kind" .= s "rpc"]]
+
+  it "a request item (spec/08's, gone) is no stream item" $
+    (decodes @PlexusStreamItem (object
+      [ "type" .= s "request", meta, "request_id" .= s "r1"
+      , "request" .= object ["type" .= s "confirm", "message" .= s "ok?"] ]))
+      `shouldSatisfy` either (const True) (const False)
+
+  it "a data item whose content says needs_input is an ordinary data item" $ do
+    let content = object ["type" .= s "needs_input", "summary" .= s "go", "token" .= s "t"]
+    item <- roundTrips @PlexusStreamItem normalizeFrame (object
+      [ "type" .= s "data", meta, "content_type" .= s "tickets.archive", "content" .= content ])
+    case item of
+      StreamData _ _ _ c -> c `shouldBe` content
+      other -> expectationFailure ("not a data item: " <> show other)

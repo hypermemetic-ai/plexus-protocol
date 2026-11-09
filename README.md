@@ -188,7 +188,7 @@ data MethodSchema = MethodSchema
   , methodError       :: Maybe Value  -- JSON Schema of the error type E (fallible methods)
   , methodProgress    :: Maybe Value  -- JSON Schema of the progress type P
   , methodCardinality :: Cardinality  -- CardinalityOne | CardinalityMany (required)
-  , …                                 -- bidirectional, http_method, request/response types, deprecation, role
+  , …                                 -- http_method, deprecation, role, …
   }
 
 data SchemaResult
