@@ -36,6 +36,7 @@ import Plexus.Auth (Refusal (..), View (..))
 import Plexus.RemoteError
 import Plexus.Schema.Recursive
 import Plexus.Types hiding (GuidanceErrorType (..))
+import Plexus.Transport (schemaNotFound)
 
 -- ============================================================================
 -- The fixture
@@ -165,6 +166,7 @@ spec = do
   strictnessSpec
   mergedSpec
   noBidirSpec
+  slotSpec
 
 schemaSpec :: Spec
 schemaSpec = describe "expected/schema.json" $ do
@@ -762,3 +764,74 @@ noBidirSpec = describe "no bidir (ASK-1)" $ do
     case item of
       StreamData _ _ _ c -> c `shouldBe` content
       other -> expectationFailure ("not a data item: " <> show other)
+
+-- | NEST-5 / NEST-7 (SYNAPSE-41): a schema's slots as plexus-core 0.10
+-- writes them — a peer slot is a @static_child@ marked @peer@, with its
+-- list and search methods and its interface; a dynamic child carries its
+-- slot type as @child@. Each reads and writes back the same; a schema from
+-- before them reads as it did.
+slotSpec :: Spec
+slotSpec = describe "slots: peer and typed dynamic child (NEST-5, NEST-7)" $ do
+  let schema ns = object
+        [ "namespace" .= s ns, "version" .= s "0.1.0", "description" .= s "d", "hash" .= s "h1"
+        , "methods" .= [ object [ "name" .= s "get", "description" .= s "g", "hash" .= s "m1"
+                                , "returns" .= object [], "cardinality" .= s "one"
+                                , "http_method" .= s "POST", "role" .= object ["kind" .= s "rpc"] ] ] ]
+      iface = object
+        [ "name" .= s "forge", "hash" .= s "ih", "ir" .= object ["irVersion" .= s "3.0"]
+        , "methods" .= object ["get" .= s "m1"], "schema" .= schema "forge" ]
+
+  it "a peer slot reads as MethodRolePeer and writes back as static_child with peer" $ do
+    let v = object [ "kind" .= s "static_child", "peer" .= True, "list_method" .= s "names"
+                   , "search_method" .= s "find", "interface" .= iface ]
+    r <- roundTrips @MethodRole id v
+    case r of
+      MethodRolePeer (Just "names") (Just "find") (Just i) -> do
+        interfaceName i `shouldBe` "forge"
+        psNamespace (interfaceSchema i) `shouldBe` "forge"
+      other -> expectationFailure ("not a typed peer slot: " <> show other)
+    isSlotRole r `shouldBe` True
+
+  it "an untyped peer slot (dyn.peer) reads with its list method alone" $ do
+    r <- roundTrips @MethodRole id (object ["kind" .= s "static_child", "peer" .= True, "list_method" .= s "names"])
+    r `shouldBe` MethodRolePeer (Just "names") Nothing Nothing
+
+  it "a static child without peer, or with peer false, is the nullary static child" $ do
+    decodes (object ["kind" .= s "static_child"]) `shouldBe` Right MethodRoleStaticChild
+    decodes (object ["kind" .= s "static_child", "peer" .= False]) `shouldBe` Right MethodRoleStaticChild
+    isSlotRole MethodRoleStaticChild `shouldBe` False
+
+  it "a typed dynamic child keeps its slot type" $ do
+    let v = object [ "kind" .= s "dynamic_child", "list_method" .= s "names", "child" .= schema "config_key" ]
+    r <- roundTrips @MethodRole id v
+    fmap psNamespace (childSchema r) `shouldBe` Just "config_key"
+    isSlotRole r `shouldBe` True
+
+  it "an untyped dynamic child (before NEST-5) reads as before" $ do
+    r <- roundTrips @MethodRole id (object ["kind" .= s "dynamic_child", "list_method" .= s "planet_names"])
+    r `shouldBe` MethodRoleDynamicChild (Just "planet_names") Nothing Nothing
+
+  it "a slot type or interface this reader cannot read leaves the slot untyped" $ do
+    decodes (object ["kind" .= s "dynamic_child", "child" .= s "?"])
+      `shouldBe` Right (MethodRoleDynamicChild Nothing Nothing Nothing)
+    decodes (object ["kind" .= s "static_child", "peer" .= True, "interface" .= object ["name" .= s "x"]])
+      `shouldBe` Right (MethodRolePeer Nothing Nothing Nothing)
+
+  it "a method whose role is a peer slot round-trips through MethodSchema" $ do
+    let m = object
+          [ "name" .= s "peer", "description" .= s "a peer", "hash" .= s "p1"
+          , "returns" .= object [], "cardinality" .= s "one", "http_method" .= s "POST"
+          , "role" .= object ["kind" .= s "static_child", "peer" .= True, "list_method" .= s "names"] ]
+    ms <- roundTrips @MethodSchema id m
+    methodRole ms `shouldBe` MethodRolePeer (Just "names") Nothing Nothing
+
+  it "a schema call's items say not found only for activation or method not found" $ do
+    let meta = Provenance ["svc"]
+        err e = StreamError "" meta e False
+    schemaNotFound [err (ActivationNotFound "nope")] `shouldBe` True
+    schemaNotFound [err (MethodNotFound "dyn" "nope")] `shouldBe` True
+    schemaNotFound [err (Other "not_found" KM.empty)] `shouldBe` True
+    schemaNotFound [err (Other "forbidden_peer" KM.empty)] `shouldBe` False
+    schemaNotFound [err Unauthenticated] `shouldBe` False
+    schemaNotFound [err (Execution "boom")] `shouldBe` False
+    schemaNotFound [] `shouldBe` False

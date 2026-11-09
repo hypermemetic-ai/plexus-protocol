@@ -39,6 +39,8 @@ module Plexus.Schema.Recursive
   , DeprecationInfo(..)
   , ParamSchema(..)
   , MethodRole(..)
+  , PeerInterface(..)
+  , isSlotRole
 
     -- * The caller's view (AUTH-3 / AUTH-4)
   , View(..)
@@ -115,8 +117,13 @@ instance ToJSON DeprecationInfo where
 --   @
 --   {"kind": "rpc"}
 --   {"kind": "static_child"}
---   {"kind": "dynamic_child", "list_method": "planet_names", "search_method": null}
+--   {"kind": "static_child", "peer": true, "list_method": "names", "interface": {…}}
+--   {"kind": "dynamic_child", "list_method": "planet_names", "search_method": null, "child": {…}}
 --   @
+--
+--   A peer slot (NEST-7, @#[plexus_macros::peer]@) goes on the wire as a
+--   @static_child@ marked @peer: true@, as plexus-core's @MethodRoleWire@
+--   writes it; it is read as 'MethodRolePeer' and written back the same.
 --
 --   Defaults to 'MethodRoleRpc' when absent so pre-IR servers deserialize
 --   cleanly (see 'MethodSchema.methodRole' parser).
@@ -126,27 +133,94 @@ data MethodRole
   | MethodRoleDynamicChild
       { listMethod   :: Maybe Text
       , searchMethod :: Maybe Text
+      , childSchema  :: Maybe PluginSchema
+        -- ^ NEST-5: the slot's type, for a typed dynamic child (@child@)
+      }
+  | MethodRolePeer
+      -- ^ NEST-7: a slot of peers found by name at call time: the segment
+      -- after the method is a peer's name (@dyn.peer.<name>.…@)
+      { listMethod    :: Maybe Text
+      , searchMethod  :: Maybe Text
+      , peerInterface :: Maybe PeerInterface
+        -- ^ a typed peer slot's interface (@interface@)
       }
   deriving stock (Show, Eq, Generic)
+
+-- | NEST-7: a peer's shape, named and content-addressed — plexus-core's
+--   @peer::Interface@: its name, the shape's hash, its IR (kept as the
+--   JSON it came as), each method's own hash, and the schema it was read
+--   from.
+data PeerInterface = PeerInterface
+  { interfaceName    :: Text
+  , interfaceHash    :: Text
+  , interfaceIr      :: Value
+  , interfaceMethods :: Map Text Text
+  , interfaceSchema  :: PluginSchema
+  }
+  deriving stock (Show, Eq, Generic)
+
+instance FromJSON PeerInterface where
+  parseJSON = withObject "PeerInterface" $ \o -> PeerInterface
+    <$> o .:  "name"
+    <*> o .:  "hash"
+    <*> o .:? "ir" .!= Null
+    <*> o .:? "methods" .!= mempty
+    <*> o .:  "schema"
+
+instance ToJSON PeerInterface where
+  toJSON PeerInterface{..} = object
+    [ "name"    .= interfaceName
+    , "hash"    .= interfaceHash
+    , "ir"      .= interfaceIr
+    , "methods" .= interfaceMethods
+    , "schema"  .= interfaceSchema
+    ]
+
+-- | Whether a role is a slot whose names are open: a dynamic child's keys
+--   or a peer slot's peers (NEST-5, NEST-7).
+isSlotRole :: MethodRole -> Bool
+isSlotRole = \case
+  MethodRoleDynamicChild{} -> True
+  MethodRolePeer{}         -> True
+  _                        -> False
 
 instance FromJSON MethodRole where
   parseJSON = withObject "MethodRole" $ \o -> do
     kind <- o .: "kind" :: Parser Text
     case kind of
       "rpc"           -> pure MethodRoleRpc
-      "static_child"  -> pure MethodRoleStaticChild
+      "static_child"  -> do
+        peer <- o .:? "peer" .!= False
+        if peer
+          then MethodRolePeer
+            <$> o .:? "list_method"
+            <*> o .:? "search_method"
+            -- an interface this reader cannot read leaves the slot untyped
+            <*> (o .:? "interface" <|> pure Nothing)
+          else pure MethodRoleStaticChild
       "dynamic_child" -> MethodRoleDynamicChild
         <$> o .:? "list_method"
         <*> o .:? "search_method"
+        -- a slot type this reader cannot read leaves the slot untyped
+        <*> (o .:? "child" <|> pure Nothing)
       other -> fail $ "Unknown MethodRole kind: " <> T.unpack other
 
+-- | Encodes as plexus-core's @MethodRoleWire@: an absent optional field is
+--   omitted, and a peer slot is a @static_child@ with @peer: true@.
 instance ToJSON MethodRole where
   toJSON MethodRoleRpc         = object ["kind" .= ("rpc" :: Text)]
   toJSON MethodRoleStaticChild = object ["kind" .= ("static_child" :: Text)]
-  toJSON (MethodRoleDynamicChild lm sm) =
+  toJSON (MethodRoleDynamicChild lm sm ch) =
     object $ ("kind" .= ("dynamic_child" :: Text)) : catMaybes
       [ ("list_method"   .=) <$> lm
       , ("search_method" .=) <$> sm
+      , ("child"         .=) <$> ch
+      ]
+  toJSON (MethodRolePeer lm sm iface) =
+    object $ ("kind" .= ("static_child" :: Text)) : ("peer" .= True) : catMaybes
+      [ ("list_method"   .=) <$> lm
+      , ("search_method" .=) <$> sm
+      , ("interface"     .=) <$> iface
       ]
 
 -- | Shallow parameter schema with optional per-field deprecation.

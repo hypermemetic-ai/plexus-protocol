@@ -1,5 +1,33 @@
 # Changelog for plexus-protocol
 
+## 0.8.0.0
+
+A schema's slots as plexus-core 0.10 writes them (NEST-5, NEST-7;
+SYNAPSE-41). Breaking: `MethodRole` gains a constructor and a field, so an
+exhaustive match or a positional pattern on it changes.
+
+### Breaking
+
+- **`MethodRolePeer { listMethod, searchMethod, peerInterface }`**: a peer
+  slot (`#[plexus_macros::peer]`, e.g. plexus-dyn's `dyn.peer.<name>`). On the
+  wire it is plexus-core's `{"kind": "static_child", "peer": true, …}` — read
+  as `MethodRolePeer` and written back the same; a `static_child` without
+  `peer` (or with `peer: false`) is `MethodRoleStaticChild` as before.
+- **`MethodRoleDynamicChild` gains `childSchema :: Maybe PluginSchema`**: a
+  typed dynamic child's slot type (`child`). `MethodRoleDynamicChild lm sm`
+  is now `MethodRoleDynamicChild lm sm ch`.
+
+### Added
+
+- `PeerInterface` (`name`, `hash`, `ir` kept as JSON, `methods`, `schema`):
+  plexus-core's `peer::Interface`. A slot type or interface this reader
+  cannot read leaves the slot untyped rather than failing the schema.
+- `isSlotRole`: a dynamic child or a peer slot — a role whose names are open.
+- `Plexus.Transport.fetchSchemaAtIfAny`: the schema at a path that may not be
+  there — `Right Nothing` when the service says activation or method not
+  found (or a slot's `not_found`), every other failure `Left` as `fetchSchemaAt` says it;
+  `schemaNotFound` is its test on a call's items.
+
 ## 0.7.0.0
 
 bidir removed (ASK-1, ASK-3). Breaking.
